@@ -92,6 +92,21 @@ if (!fs.existsSync(reqSrc)) {
 fs.copyFileSync(reqSrc, path.join(DEST, "requirements.txt"));
 console.log("  ✓ requirements.txt");
 
+// Copy aio_search_cli.py — root-level CLI glue that aio-dl.py imports at
+// runtime when --search is passed (deferred imports around aio-dl.py:3811).
+// It's not in sites/ so the recursive copy below doesn't pick it up.
+// Without this, --search crashes with ModuleNotFoundError in installed builds.
+//
+// If you add another root-level Python module that aio-dl.py imports
+// (sibling of aio-dl.py, not under sites/), copy it here too.
+const searchCliSrc = path.join(AIO_SOURCE, "aio_search_cli.py");
+if (!fs.existsSync(searchCliSrc)) {
+  console.error(`ERROR: aio_search_cli.py not found at ${searchCliSrc}`);
+  process.exit(1);
+}
+fs.copyFileSync(searchCliSrc, path.join(DEST, "aio_search_cli.py"));
+console.log("  ✓ aio_search_cli.py");
+
 // Copy sites/ folder
 const sitesSrc = path.join(AIO_SOURCE, "sites");
 if (!fs.existsSync(sitesSrc)) {
