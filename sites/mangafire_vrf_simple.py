@@ -2050,6 +2050,37 @@ def get_vrf_generator() -> _VRFBridge:
     return _VRF_BRIDGE
 
 
+def populate_vrf_cache(items: Dict[str, str]) -> None:
+    """External-write API used by sites/mangafire_vrf_async_batch.py to flow
+    VRFs captured via Patchright async-API into the same _vrf_cache the sync
+    bridge reads from. ensure_vrf() then hits cache instantly.
+
+    items maps ajax_path (e.g. '/ajax/read/chapter/4315866') -> token.
+    Idempotent: re-populating the same path just overwrites with a fresh
+    token (which is fine — both are valid for that chapter)."""
+    if not items:
+        return
+    # Lazy-init the singleton if not started yet so the cache exists on its
+    # instance. Bridges through the worker thread so we touch the same dict.
+    def _populate(d):
+        for k, v in d.items():
+            _VRF_GEN._vrf_cache[k] = v
+            _VRF_GEN._vrf_meta[k] = {"ts": time.time(), "full_url": "", "page_url": "<async-batch>"}
+    _VRF_EXECUTOR.submit(lambda: _populate(items)).result(timeout=5.0)
+    # Also kick the singleton-init so _VRF_GEN exists before the call.
+
+
+def _ensure_vrf_singleton_started() -> None:
+    """Force lazy-init of the sync VRF generator on its dedicated thread.
+    Used by the async batch class so it can read the persistent
+    storage_state.json that the sync side has been keeping warm."""
+    def _init():
+        global _VRF_GEN
+        if _VRF_GEN is None:
+            _VRF_GEN = SimpleMangaFireVRFGenerator()
+    _VRF_EXECUTOR.submit(_init).result(timeout=10.0)
+
+
 def generate_vrf_token(url_path: str) -> str:
     """Backward-compatible helper."""
     return get_vrf_generator().generate_vrf(url_path)

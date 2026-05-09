@@ -8,3 +8,4 @@ pywidevine
 cryptography
 patchright>=1.40.0  # Drop-in Playwright fork with CDP-leak patches (Cloudflare-stealthier). Drives sites/mangafire_vrf_simple.py and sites/playwright_utils.py.
 rapidfuzz  # Cross-site search title matching (sites/search_orchestrator.py)
+curl_cffi>=0.7.0  # MangaFire fast image-download path (HTTP/2 + Chrome120 TLS fingerprint, async). See sites/mangafire.py:fast_download_images.

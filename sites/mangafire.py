@@ -49,18 +49,30 @@ def _mf_throttle(tag: str = "request") -> None:
         return
     time.sleep(base * random.uniform(0.7, 1.3))
 
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
 from .base import BaseSiteHandler, SearchHit, SiteComicContext
+from ._image_io import finalize_pending_image
 
 try:
     from .mangafire_vrf_simple import get_vrf_generator
     VRF_AVAILABLE = True
 except Exception:
     VRF_AVAILABLE = False
+
+# curl_cffi powers the fast image-download path. HTTP/2 multiplex over a
+# single keep-alive AsyncSession + Chrome120 TLS fingerprint. ImportError
+# fallback toggles SUPPORTS_FAST_DOWNLOAD off so the main loop reverts to
+# its existing ThreadPoolExecutor + cloudscraper path. Pinned to >=0.7.0
+# in requirements.txt for the AsyncSession API.
+try:
+    from curl_cffi.requests import AsyncSession as _CurlCffiAsyncSession
+    _CURL_CFFI_AVAILABLE = True
+except Exception:  # ImportError or any sub-dep failure
+    _CURL_CFFI_AVAILABLE = False
 
 
 def _env_int(name: str, default: int) -> int:
@@ -94,6 +106,17 @@ class MangaFireSiteHandler(BaseSiteHandler):
     # image fetches × N noise results per search. See
     # search_orchestrator.py:EXPENSIVE_PROBE_QUICK_THRESHOLD.
     EXPENSIVE_PROBE = True
+
+    # Class-level capability flag picked up by aio-dl.py's chapter loop. When
+    # True (and curl_cffi is importable), Phase 2 of _process_chapter_impl and
+    # the inter-chapter image prefetch route through fast_download_images
+    # (curl_cffi async + HTTP/2) instead of the generic ThreadPoolExecutor +
+    # dl_image cloudscraper path. Bench (2026-05-09, 83-page chapter):
+    # cloudscraper 3-thread = 10.20s; curl_cffi async @ conc=8 = 6.04s. The
+    # ceiling is the local network bandwidth (~5 MB/s on this test network);
+    # higher concurrency past ~12 is diminishing returns. Toggled off if
+    # curl_cffi failed to import — main loop falls back gracefully.
+    SUPPORTS_FAST_DOWNLOAD = _CURL_CFFI_AVAILABLE
 
     _BASE_URL = "https://mangafire.to"
 
@@ -533,6 +556,170 @@ class MangaFireSiteHandler(BaseSiteHandler):
             return data
         except Exception:
             return None
+
+    # ----------------------------- Fast image download path -----------------
+    # Bulk chapter-image fetch via curl_cffi async + HTTP/2 + Chrome120 TLS
+    # impersonation. Replaces the generic dl_image+ThreadPoolExecutor path in
+    # aio-dl.py:_process_chapter_impl and _start_image_prefetch._worker for
+    # MangaFire only (gated by SUPPORTS_FAST_DOWNLOAD).
+    #
+    # Why curl_cffi: bench shows ~1.7x faster than cloudscraper 3-thread on
+    # an 83-page chapter (10.20s -> 6.04s). The win is HTTP/2 multiplex over
+    # one keep-alive TLS session — eliminates per-page handshake. CF edge
+    # cache (cf-cache=HIT for repeated chapters) means the bandwidth ceiling
+    # is the user's network, not the origin server.
+    #
+    # No URL-variant cascade: tested live 2026-05-09 — alternative path
+    # segments (/o/, /full/, /orig/) and extensions (.png, .webp) all 404 on
+    # the image CDN. The first URL works or it doesn't. One transient retry
+    # on hard failure; on second failure return None for that page so the
+    # caller's per-chapter zero-tolerance check fires the inline-retry path.
+    #
+    # Cancellation + host-poison: caller passes callbacks so this method
+    # stays decoupled from aio-dl.py's module globals. is_cancelled() short-
+    # circuits in-flight fetches; record_host_failure(host, url) feeds
+    # aio-dl's _HOST_FAIL_COUNT so the chapter watchdog can fast-fail when a
+    # CDN is poisoned for this run.
+    def fast_download_images(
+        self,
+        download_tasks: List[Tuple[int, str, str, str]],
+        *,
+        concurrency: int = 8,
+        timeout: float = 30.0,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+        record_host_failure: Optional[Callable[[str, str], None]] = None,
+    ) -> List[Tuple[int, Optional[str]]]:
+        """Bulk-download chapter images via curl_cffi async + HTTP/2.
+
+        Args:
+          download_tasks: list of (page_index, url, folder, filename) tuples,
+                          same shape aio-dl.py constructs in Phase 1. The
+                          filename is a base placeholder like "5_0001.jpg";
+                          finalize_pending_image rewrites the extension based
+                          on actual bytes.
+          concurrency:    asyncio.Semaphore bound. 8 is the bench-stable
+                          default. Past ~12 is diminishing returns on most
+                          home networks (network-bandwidth-limited).
+          timeout:        Per-request socket timeout. 30s matches aio-dl.py's
+                          default _HTTP_TIMEOUT.
+          is_cancelled:   Optional callback. When True, every in-flight fetch
+                          checks before sending the next request and bails.
+          record_host_failure: Optional callback fired when a URL hard-fails.
+                          Updates aio-dl's _HOST_FAIL_COUNT so the chapter
+                          watchdog can poison-detect a flaky CDN.
+
+        Returns: list of (page_index, path_or_None), ordered by page_index.
+        path_or_None matches dl_image's contract — None signals failure.
+        """
+        if not _CURL_CFFI_AVAILABLE:
+            raise RuntimeError(
+                "fast_download_images called without curl_cffi installed. "
+                "Caller should check SUPPORTS_FAST_DOWNLOAD before invoking."
+            )
+        if not download_tasks:
+            return []
+
+        import asyncio
+
+        # Headers: anti-hotlink Referer + Chrome UA matching the Patchright
+        # session's UA (so cf_clearance fingerprint stays consistent if CF
+        # ever starts cookie-validating image hits — currently they're
+        # cookieless edge-cache HITs, but be defensive).
+        headers = {
+            "Referer": self._BASE_URL + "/",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+        }
+
+        async def _fetch_one(
+            session, sema, page_idx: int, url: str, folder: str, filename: str
+        ) -> Tuple[int, Optional[str]]:
+            base, _ = os.path.splitext(filename)
+            if not base:
+                base = filename
+            pending_path = os.path.join(folder, f".pending_{base}")
+            host = urlparse(url).netloc
+
+            # Two attempts: original + one retry on transient failure. No
+            # variant cascade — alternates don't exist on this CDN.
+            for attempt in range(2):
+                if is_cancelled is not None and is_cancelled():
+                    return page_idx, None
+                async with sema:
+                    # Re-check after sema acquire — coroutines that were
+                    # queued before cancel was set should still bail here
+                    # rather than firing a GET they were already cancelled
+                    # for. (Without this, large queues + late cancel = the
+                    # remaining tail still issues HTTP requests.)
+                    if is_cancelled is not None and is_cancelled():
+                        return page_idx, None
+                    try:
+                        r = await session.get(url, headers=headers, timeout=timeout)
+                    except Exception as exc:
+                        if attempt < 1:
+                            await asyncio.sleep(1.0)
+                            continue
+                        if record_host_failure is not None:
+                            try:
+                                record_host_failure(host, url)
+                            except Exception:
+                                pass
+                        return page_idx, None
+                if r.status_code != 200 or not r.content or len(r.content) < 256:
+                    if attempt < 1:
+                        await asyncio.sleep(1.0)
+                        continue
+                    if record_host_failure is not None:
+                        try:
+                            record_host_failure(host, url)
+                        except Exception:
+                            pass
+                    return page_idx, None
+                # Bytes look real — write pending file then atomic-rename.
+                # finalize_pending_image runs sync; safe inside the coroutine
+                # because file I/O is the same cost either way.
+                try:
+                    os.makedirs(folder, exist_ok=True)
+                    with open(pending_path, "wb") as fh:
+                        fh.write(r.content)
+                except OSError:
+                    return page_idx, None
+                content_type = ""
+                try:
+                    content_type = r.headers.get("Content-Type", "") or ""
+                except Exception:
+                    content_type = ""
+                final = finalize_pending_image(
+                    pending_path, folder, base, content_type
+                )
+                return page_idx, final
+            return page_idx, None
+
+        async def _run() -> List[Tuple[int, Optional[str]]]:
+            sema = asyncio.Semaphore(max(1, int(concurrency)))
+            # Single AsyncSession across all pages of this chapter so HTTP/2
+            # multiplex + connection keepalive amortize TLS handshake cost.
+            # impersonate=chrome120 sets the JA3/JA4 + h2 settings frame to
+            # match Chrome — should not strictly be needed for the cookieless
+            # edge-cached image CDN, but defensive (and free).
+            async with _CurlCffiAsyncSession(impersonate="chrome120") as s:
+                tasks = [
+                    _fetch_one(s, sema, p_idx, url, folder, name)
+                    for p_idx, url, folder, name in download_tasks
+                ]
+                return await asyncio.gather(*tasks)
+
+        # Run in this thread's own event loop. asyncio.run constructs a fresh
+        # loop, so works whether called from main thread or from a daemon
+        # prefetch thread (each has no running loop).
+        results = asyncio.run(_run())
+        # Preserve original submission order (page_idx ascending). gather()
+        # already returns in input order, but sorting is cheap insurance.
+        results.sort(key=lambda t: t[0])
+        return results
 
     # ----------------------------- Search -----------------------------
     # MangaFire search: driven by the persistent Playwright bridge in

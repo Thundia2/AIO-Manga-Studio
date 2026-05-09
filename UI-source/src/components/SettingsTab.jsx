@@ -73,6 +73,22 @@ export default function SettingsTab({ settings, onSave }) {
     // Drop to 4 (or 0) when the upstream CDN is throttling and the extra
     // concurrent burst from N+1's downloads compounds throttling.
     prefetchImageWorkers: -1,
+    // ── MangaFire-only speed knobs (added 2026-05-09) ──
+    // The MangaFire handler bypasses the generic Image Workers path and
+    // uses curl_cffi async + HTTP/2 multiplex (sites/mangafire.py:
+    // fast_download_images). These three settings tune that path:
+    //   - imageConcurrency: asyncio.Semaphore bound for image fetches.
+    //     8 hits ~5 MB/s (network-ceiling on most home links).
+    //   - vrfPrefetchDepth: how many chapters ahead to queue VRF capture.
+    //     The queued worker captures sequentially; depth=4 fully overlaps
+    //     capture with the previous chapter's image download.
+    //   - vrfParallel: opt-in concurrent multi-page VRF capture (1 = off).
+    //     4 = bench-confirmed 5.2x speedup but can trigger CF rate-limit.
+    // queueDownload (useDownloader.js) injects each into args only when
+    // not at default, so older saved settings dicts behave unchanged.
+    mangafireImageConcurrency: 8,
+    mangafireVrfPrefetchDepth: 4,
+    mangafireVrfParallel: 1,
     // How often the UI refreshes logs & progress (in milliseconds).
     // Lower = more responsive. Default: 100ms (10 updates/sec).
     logUpdateInterval: 100,
@@ -155,6 +171,9 @@ export default function SettingsTab({ settings, onSave }) {
       verboseAlways: true,
       collapseSplits: true,
       prefetchImageWorkers: -1,
+      mangafireImageConcurrency: 8,
+      mangafireVrfPrefetchDepth: 4,
+      mangafireVrfParallel: 1,
       logUpdateInterval: 100,
       useFileBasedChapterCheck: false,
       defaults: {
@@ -568,6 +587,118 @@ export default function SettingsTab({ settings, onSave }) {
                 setDefault("httpMaxRetries", Math.trunc(v));
               }}
               className="mt-1"
+            />
+          </div>
+        </div>
+
+        {/* MangaFire Speed (added 2026-05-09) ─────────────────────
+            MangaFire-only optimizations. Bypasses the generic Image Workers
+            setting via SUPPORTS_FAST_DOWNLOAD on MangaFireSiteHandler
+            (sites/mangafire.py). curl_cffi async + HTTP/2 multiplex over a
+            single keep-alive TLS session. Bench (83-page chapter):
+            cloudscraper@3 = 10.20s -> curl_cffi@8 = 6.04s (1.69x). Other
+            sites still use Image Workers from "Default Network Settings". */}
+        <SectionHeader>MangaFire Speed</SectionHeader>
+        <p className="text-[10px] text-muted-foreground -mt-1 mb-2">
+          MangaFire-specific tuning. The image fetcher uses HTTP/2 multiplex over a
+          single TLS connection (curl_cffi async), which bypasses the generic
+          Image Workers setting above. Other sites still use Image Workers.
+        </p>
+        <div className="space-y-3">
+          {/* Image concurrency for the curl_cffi async fetcher.
+              Same row layout as "Prefetch workers for next chapter" above —
+              left side: label + description; right side: small numeric input. */}
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex-1">
+              <Label className="text-xs cursor-pointer">Image concurrency</Label>
+              <p className="text-[10px] text-muted-foreground mt-0.5">
+                Concurrent in-flight image fetches via HTTP/2 multiplex. Default
+                {" "}<span className="font-mono">8</span> hits ~5 MB/s — typical home-network ceiling.
+                Past <span className="font-mono">12</span> is diminishing returns. Drop to
+                {" "}<span className="font-mono">3</span> if Cloudflare starts rate-limiting (rare
+                on the cookieless edge cache, but defensive).
+              </p>
+            </div>
+            <Input
+              type="number"
+              min={1}
+              max={32}
+              step={1}
+              value={local.mangafireImageConcurrency ?? 8}
+              onChange={(e) => {
+                // Same int-parse + clamp pattern as imageWorkers above.
+                // Python's --mangafire-image-concurrency is argparse type=int;
+                // a decimal here would crash the next spawn.
+                const raw = e.target.value;
+                if (raw === "") { set("mangafireImageConcurrency", 8); return; }
+                const v = Number(raw);
+                if (!Number.isFinite(v)) { set("mangafireImageConcurrency", 8); return; }
+                set("mangafireImageConcurrency", Math.max(1, Math.min(32, Math.trunc(v))));
+              }}
+              className="w-20 shrink-0 font-mono tabular-nums"
+            />
+          </div>
+
+          {/* VRF prefetch chain depth. 0 disables; aio-dl.py:
+              _start_vrf_prefetch_chain returns early on depth<=0. */}
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex-1">
+              <Label className="text-xs cursor-pointer">VRF prefetch depth</Label>
+              <p className="text-[10px] text-muted-foreground mt-0.5">
+                How many chapters ahead to queue VRF token capture during image
+                download. Default <span className="font-mono">4</span> fully overlaps
+                token capture with the previous chapter's image fetch.
+                {" "}<span className="font-mono">0</span> disables prefetch (each chapter waits
+                synchronously for its own VRF — slower but lighter).
+              </p>
+            </div>
+            <Input
+              type="number"
+              min={0}
+              max={16}
+              step={1}
+              value={local.mangafireVrfPrefetchDepth ?? 4}
+              onChange={(e) => {
+                const raw = e.target.value;
+                if (raw === "") { set("mangafireVrfPrefetchDepth", 4); return; }
+                const v = Number(raw);
+                if (!Number.isFinite(v) || v < 0) { set("mangafireVrfPrefetchDepth", 4); return; }
+                set("mangafireVrfPrefetchDepth", Math.max(0, Math.min(16, Math.trunc(v))));
+              }}
+              className="w-20 shrink-0 font-mono tabular-nums"
+            />
+          </div>
+
+          {/* Multi-page parallel VRF capture (opt-in). When > 1, the chain
+              worker batches and submits to AsyncBatchVRFCapture (Patchright
+              async API). 4 is bench-confirmed working; >=6 reliably trips
+              CF burst-detect. We treat this as opt-in; defaults to 1. */}
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex-1">
+              <Label className="text-xs cursor-pointer">Parallel VRF capture</Label>
+              <p className="text-[10px] text-muted-foreground mt-0.5">
+                Opt-in. Default <span className="font-mono">1</span> = sequential (safe).
+                {" "}<span className="font-mono">4</span> = capture 4 chapters' VRFs concurrently in
+                one browser (bench: 5.2× speedup), but can trigger Cloudflare
+                rate-limit on some sessions. Worth enabling for large downloads
+                (50+ chapters) on a stable IP. Falls back to sequential
+                transparently if Cloudflare bounces a batch.
+              </p>
+            </div>
+            <Input
+              type="number"
+              min={1}
+              max={8}
+              step={1}
+              value={local.mangafireVrfParallel ?? 1}
+              onChange={(e) => {
+                const raw = e.target.value;
+                if (raw === "") { set("mangafireVrfParallel", 1); return; }
+                const v = Number(raw);
+                if (!Number.isFinite(v) || v < 1) { set("mangafireVrfParallel", 1); return; }
+                set("mangafireVrfParallel", Math.max(1, Math.min(8, Math.trunc(v))));
+              }}
+              className="w-20 shrink-0 font-mono tabular-nums"
             />
           </div>
         </div>

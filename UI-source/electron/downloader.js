@@ -106,6 +106,12 @@ function buildCliArgs(args) {
     multiSourceQualityMin: "--multi-source-quality-min",
     multiSourcePrefetched: "--multi-source-prefetched",
     prefetchImageWorkers: "--prefetch-image-workers",
+    // MangaFire-only speed knobs (2026-05-09). Settings injects each only
+    // when not at default (see useDownloader.js:queueDownload), so non-
+    // MangaFire downloads or default-config runs don't carry these flags.
+    mangafireImageConcurrency: "--mangafire-image-concurrency",
+    mangafireVrfPrefetchDepth: "--mangafire-vrf-prefetch-depth",
+    mangafireVrfParallel: "--mangafire-vrf-parallel",
     missedRetries: "--missed-retries",
     missedLog: "--missed-log",
     jobStallTimeout: "--job-stall-timeout",

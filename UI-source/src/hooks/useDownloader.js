@@ -382,6 +382,20 @@ export function useDownloader() {
         ...(s?.prefetchImageWorkers != null && s.prefetchImageWorkers !== -1
           ? { prefetchImageWorkers: s.prefetchImageWorkers }
           : {}),
+        // ── MangaFire-only speed knobs (added 2026-05-09) ──
+        // Same "skip if at default" pattern as prefetchImageWorkers above:
+        // when the setting matches the Python-side default, leave it out of
+        // the spawn so older saved settings dicts that don't have the field
+        // still produce identical CLI invocations. Python defaults: 8, 4, 1.
+        ...(s?.mangafireImageConcurrency != null && s.mangafireImageConcurrency !== 8
+          ? { mangafireImageConcurrency: s.mangafireImageConcurrency }
+          : {}),
+        ...(s?.mangafireVrfPrefetchDepth != null && s.mangafireVrfPrefetchDepth !== 4
+          ? { mangafireVrfPrefetchDepth: s.mangafireVrfPrefetchDepth }
+          : {}),
+        ...(s?.mangafireVrfParallel != null && s.mangafireVrfParallel !== 1
+          ? { mangafireVrfParallel: s.mangafireVrfParallel }
+          : {}),
         ...args,
       };
 

@@ -79,6 +79,7 @@ const REQUIRED_IMPORTS = [
   ["patchright",    "from patchright.sync_api import sync_playwright"],
   ["pywidevine",    "from pywidevine import PSSH, Cdm"],
   ["cryptography",  "from cryptography.hazmat.primitives import hashes"],
+  ["curl_cffi",     "from curl_cffi.requests import AsyncSession"],
 ];
 
 // ZIP files always start with these 4 bytes ("PK\x03\x04").
