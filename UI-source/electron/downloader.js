@@ -136,6 +136,13 @@ function buildCliArgs(args) {
     noRetryMissedChapters: "--no-retry-missed-chapters",
     restoreParameters: "--restore-parameters",
     promptUrls: "--prompt-urls",
+    // Curated-sites toggle for the multi-source-direct-URL fan-out.
+    // Mirror of searcher.js:70's opts.seededOnly handling — keeping the
+    // flag name symmetric (camelCase here, kebab-case CLI) means
+    // useDownloader.queueDownload's settings injection works without
+    // a separate translation step. aio-dl.py:3589 defines --seeded-only;
+    // it's read inside find_alternatives_for_direct_url at line 4432.
+    seededOnly: "--seeded-only",
   };
 
   // Add valued arguments

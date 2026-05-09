@@ -32,10 +32,15 @@ export function useDownloader() {
   const [logs, setLogs] = useState([]);
   const [resumable, setResumable] = useState([]);
   const [settings, setSettings] = useState({
-    // Sensible defaults so components don't crash before settings load
+    // Sensible defaults so components don't crash before settings load.
+    // Empty path placeholders intentionally — the real per-machine values
+    // arrive from main.js's get-settings IPC (DEV_SCRIPT_PATH derived from
+    // __dirname, or the bundled Python path in packaged mode). Used to
+    // hardcode an absolute path to the original developer's OneDrive
+    // folder, which mkdirSync would silently create on any other machine.
     pythonCmd: "python",
-    scriptPath: String.raw`C:\Users\legoc\OneDrive\Belgeler\AIO-Webtoon-Downloader\aio-dl.py`,
-    workingDir: String.raw`C:\Users\legoc\OneDrive\Belgeler\AIO-Webtoon-Downloader`,
+    scriptPath: "",
+    workingDir: "",
     defaults: {},
     verboseAlways: true,
     // Global toggle: collapse split-cluster chapters at download time AND in
@@ -376,6 +381,17 @@ export function useDownloader() {
       const finalArgs = {
         verbose: s?.verboseAlways !== false,
         collapseSplits: s?.collapseSplits !== false,
+        // Curated-sites toggle. Persisted under settings.searchOpts.seededOnly
+        // because SettingsTab + SearchTab both write that namespace; we mirror
+        // it here so download paths see the same flag. Only takes effect when
+        // --multi-source is on — aio-dl.py reads seeded_only inside
+        // find_alternatives_for_direct_url to skip the long-tail Madara
+        // extras during the cross-site fan-out (otherwise: 282 handlers
+        // searched instead of ~30 in sites/quality_seed.json).
+        // searcher.js:70 uses the identical opts.seededOnly check; this
+        // closes the asymmetry where Search honored the toggle but
+        // multi-source-direct-URL downloads ignored it.
+        ...(s?.searchOpts?.seededOnly ? { seededOnly: true } : {}),
         // -1 sentinel = "match --image-workers"; the Python side resolves it.
         // Skip injecting if the value is explicitly -1 (the default) so the
         // CLI default also kicks in without a redundant flag in the spawn.

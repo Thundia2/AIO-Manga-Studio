@@ -28,11 +28,18 @@ const { scanLibrary, generateMissingThumbnails, downloadMissingCovers, cleanupOr
 
 // ── DEV MODE DEFAULTS ──
 // When running from source (npm run electron:dev), the app uses
-// your system Python and your local AIO downloader script.
-// Change these paths if yours are different.
+// your system Python and the aio-dl.py / project root that ship in
+// this checkout — derived from __dirname so the defaults follow the
+// repo wherever it's cloned. Used to bake in an absolute path to the
+// original developer's OneDrive folder, which mkdirSync would silently
+// re-create on any other machine and leave the user staring at a
+// stranger's home path in Settings.
+//
+// __dirname at runtime is UI-source/electron/, so:
+//   ../..  → repo root  (where aio-dl.py + sites/ live in dev)
 const DEV_PYTHON_CMD = "python";
-const DEV_SCRIPT_PATH = String.raw`C:\Users\legoc\OneDrive\Belgeler\AIO-Webtoon-Downloader\aio-dl.py`;
-const DEV_WORKING_DIR = String.raw`C:\Users\legoc\OneDrive\Belgeler\AIO-Webtoon-Downloader`;
+const DEV_SCRIPT_PATH = path.resolve(__dirname, "..", "..", "aio-dl.py");
+const DEV_WORKING_DIR = path.resolve(__dirname, "..", "..");
 
 // ── GLOBALS ──
 const IS_PACKAGED = app.isPackaged;

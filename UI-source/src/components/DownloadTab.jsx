@@ -20,11 +20,19 @@ import { cn } from "@/lib/utils";
 // ── DEFAULT VALUES ──
 // Match aio-dl.py's defaults so you can start a basic download
 // without changing anything.
+//
+// NOTE on quality=100 vs aio-dl.py's argparse default of 85:
+// Phase G4 in aio-dl.py (~line 4272) reads `_user_set_quality` from sys.argv;
+// any explicit --quality < 100 disables the CBZ byte-preserving fast-path.
+// The UI always emits --quality from form state (line 111), so a default
+// of 85 would force every CBZ download into the slow decode/re-encode path.
+// Keep this at 100 unless you also revisit Phase G4. Direct CLI users still
+// get aio-dl.py's argparse default of 85 — the divergence is intentional.
 const DEFAULT_FORM = {
   urls: "",
   format: "pdf",
   epubLayout: "vertical",
-  quality: 85,
+  quality: 100,
   scaling: 100,
   width: "",
   aspectRatio: "",
@@ -70,6 +78,12 @@ const FORMATS = [
   { value: "pdf", label: "PDF", desc: "Tablet reading" },
   { value: "epub", label: "EPUB", desc: "E-reader" },
   { value: "cbz", label: "CBZ", desc: "Comic archive" },
+  // The "Images only" promise is honored by the format-button onClick
+  // below (and SettingsTab's Format select), which auto-enables
+  // keepImages whenever format=none is picked. aio-dl.py:6196 silently
+  // `pass`es on format==none — without the auto-enable, this label
+  // produced an empty mangas folder. See the warning below the format
+  // grid for the user-explicitly-unchecked edge case.
   { value: "none", label: "None", desc: "Images only" },
 ];
 
@@ -207,7 +221,21 @@ export default function DownloadTab({ onStartDownload, settings }) {
           {FORMATS.map((f) => (
             <button
               key={f.value}
-              onClick={() => set("format", f.value)}
+              onClick={() => {
+                // Honor the "Images only" label promise on the None button:
+                // aio-dl.py treats --format none as "skip the final book
+                // build" and produces nothing unless --keep-images or
+                // --keep-chapters is also set. Auto-enable keepImages here
+                // so the label is truthful out of the box. setForm in one
+                // pass so the next render sees both fields consistent
+                // (avoids a brief frame where format=none but keepImages
+                // is still false, which would flash the warning below).
+                setForm((prev) => ({
+                  ...prev,
+                  format: f.value,
+                  ...(f.value === "none" ? { keepImages: true } : {}),
+                }));
+              }}
               className={cn(
                 "flex flex-col items-center gap-1 rounded-lg border p-3 transition-all text-sm",
                 form.format === f.value
@@ -220,6 +248,20 @@ export default function DownloadTab({ onStartDownload, settings }) {
             </button>
           ))}
         </div>
+        {/* Edge-case warning: only fires if the user explicitly unchecks
+            both Keep chapters and Keep images while format=none. The
+            format-button onClick above auto-enables keepImages, so the
+            normal "select None" path never trips this. Without the
+            warning, an unchecked-then-launched run would silently produce
+            an empty mangas folder (aio-dl.py:6196 `pass`es with no log). */}
+        {form.format === "none" && !form.keepImages && !form.keepChapters && (
+          <p className="text-[10px] text-yellow-500 dark:text-yellow-400 mt-2 leading-snug animate-slide-up">
+            Format = None with neither "Keep chapters" nor "Keep images"
+            checked produces nothing in the mangas folder (only metadata).
+            Re-enable one of those toggles to keep raw images or
+            per-chapter files.
+          </p>
+        )}
 
         {/* EPUB layout — only shown when EPUB is selected */}
         {form.format === "epub" && (

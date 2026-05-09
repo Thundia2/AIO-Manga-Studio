@@ -41,13 +41,21 @@ const DEFAULT_SEARCH_OPTS = {
 };
 
 // ── DEFAULT VALUES ──
-// These are used in dev mode (running from source with npm run electron:dev).
-// In packaged mode (installed .exe), main.js overrides these automatically
-// with the bundled Python paths, so these defaults won't matter.
+// Empty placeholders shown only during the brief window before main.js's
+// get-settings IPC resolves. The real per-machine defaults come from
+// main.js (DEV_SCRIPT_PATH / DEV_WORKING_DIR derived from __dirname in dev,
+// or app.getPath("documents")/AIO Downloader in packaged). Used to bake an
+// absolute path to the original developer's OneDrive folder here, which
+// mkdirSync would silently re-create on any other machine — better to show
+// blank for ~50ms than mislead the user with a stranger's home path.
+//
+// On Reset (handleReset below), dev-mode reverts to these blanks so the
+// user can re-pick their workingDir; packaged-mode preserves the existing
+// value via the prev.isPackaged guard.
 const DEV_DEFAULTS = {
   pythonCmd: "python",
-  scriptPath: String.raw`C:\Users\legoc\OneDrive\Belgeler\AIO-Webtoon-Downloader\aio-dl.py`,
-  workingDir: String.raw`C:\Users\legoc\OneDrive\Belgeler\AIO-Webtoon-Downloader`,
+  scriptPath: "",
+  workingDir: "",
 };
 
 export default function SettingsTab({ settings, onSave }) {
@@ -100,7 +108,27 @@ export default function SettingsTab({ settings, onSave }) {
     isPackaged: false,
     defaults: {
       format: "pdf",
-      quality: 85,
+      // Global download language. DownloadTab.jsx:32 had its own per-form
+      // default of "en"; surfacing it here lets the user pick a different
+      // global default (e.g. "ja" for a Japanese-only library) without
+      // changing the dropdown on every download. DownloadTab's useEffect
+      // at line ~95-99 already spreads settings.defaults onto its form,
+      // so this propagates through automatically. Library-tab downloads
+      // override with the per-series saved language; Search-tab downloads
+      // inherit via App.jsx's defaults-spread.
+      language: "en",
+      // 100 (not aio-dl.py's argparse default of 85): Phase G4 in aio-dl.py
+      // (~line 4272) sets _user_set_quality = (--quality on argv) AND
+      // (args.quality < 100). When True, the CBZ byte-preserving fast-path
+      // (cbzPreserveOriginals) is bypassed in favor of decode/re-encode.
+      // The UI always emits --quality from form state, so a default of 85
+      // would force every default CBZ download into the slow legacy path
+      // — defeating the cbzPreserveOriginals toggle for everyone except
+      // users who manually slide the quality up to 100. The Python
+      // argparse default of 85 still applies to direct CLI users; the
+      // UI's separate default is intentional. Keep this at 100 unless
+      // you also revisit the Phase G4 guard.
+      quality: 100,
       scaling: 100,
       keepChapters: false,
       noFinalFile: false,
@@ -178,7 +206,11 @@ export default function SettingsTab({ settings, onSave }) {
       useFileBasedChapterCheck: false,
       defaults: {
         format: "pdf",
-        quality: 85,
+        language: "en",
+        // See the rationale on the corresponding line in the initial-state
+        // defaults block above — 100, not 85, to keep cbzPreserveOriginals's
+        // fast-path active by default. Reset must mirror initial state.
+        quality: 100,
         scaling: 100,
         keepChapters: false,
         noFinalFile: false,
@@ -340,7 +372,25 @@ export default function SettingsTab({ settings, onSave }) {
             <Label className="text-xs">Format</Label>
             <Select
               value={local.defaults.format}
-              onChange={(e) => setDefault("format", e.target.value)}
+              onChange={(e) => {
+                const next = e.target.value;
+                // Honor the "None (images only)" label promise: aio-dl.py
+                // treats --format none as "skip the final book build" and
+                // silently passes on it (line ~6196), with no output unless
+                // --keep-images or --keep-chapters is also set. Selecting
+                // None here auto-enables keepImages so the user actually
+                // gets the images the label advertises. They can still
+                // manually uncheck keepImages later for a metadata-only
+                // run, but the warning below will fire if they do.
+                setLocal((prev) => ({
+                  ...prev,
+                  defaults: {
+                    ...prev.defaults,
+                    format: next,
+                    ...(next === "none" ? { keepImages: true } : {}),
+                  },
+                }));
+              }}
               className="mt-1"
             >
               <option value="pdf">PDF</option>
@@ -348,6 +398,21 @@ export default function SettingsTab({ settings, onSave }) {
               <option value="cbz">CBZ</option>
               <option value="none">None (images only)</option>
             </Select>
+            {/* Warning fires only when the user has explicitly unchecked
+                both Keep images and Keep chapters under format=none — the
+                only path that produces an empty mangas folder. The format
+                onChange above auto-enables keepImages, so the default
+                "select None" path never trips this. */}
+            {local.defaults.format === "none"
+              && !local.defaults.keepImages
+              && !local.defaults.keepChapters && (
+              <p className="text-[10px] text-yellow-500 dark:text-yellow-400 mt-1 leading-snug">
+                Format = None with no "Keep images" / "Keep chapters" enabled
+                produces nothing in the mangas folder (only metadata).
+                Re-enable one of those toggles to keep raw images or
+                per-chapter files.
+              </p>
+            )}
           </div>
 
           <div>
@@ -374,6 +439,27 @@ export default function SettingsTab({ settings, onSave }) {
               min={1}
               max={100}
             />
+          </div>
+
+          {/* Global default download language. DownloadTab's useEffect
+              spreads settings.defaults into its form, so picking a
+              language here makes it the default in the New tab AND in
+              search-initiated downloads (App.jsx:185-194 spreads defaults
+              into the queueDownload args). Library-tab downloads still
+              use the per-series saved language from .aio_series.json,
+              which is correct — that's the language the series was
+              originally fetched in. */}
+          <div>
+            <Label className="text-xs">Default language</Label>
+            <Select
+              value={local.defaults.language || "en"}
+              onChange={(e) => setDefault("language", e.target.value)}
+              className="mt-1"
+            >
+              {LANGUAGES.map((l) => (
+                <option key={l.value} value={l.value}>{l.label}</option>
+              ))}
+            </Select>
           </div>
         </div>
 

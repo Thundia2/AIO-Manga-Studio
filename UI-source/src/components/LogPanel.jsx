@@ -19,10 +19,14 @@ const EMPTY_LOGS = [];
 export default function LogPanel({ logs: rawLogs, onClearLogs, settings, onSaveSettings }) {
   const [filter, setFilter] = useState("");
   const [autoScroll, setAutoScroll] = useState(true);
-  const logEndRef = useRef(null);
   const containerRef = useRef(null);
   // Track the previous log count so we only auto-scroll when new lines arrive
   const prevLogCountRef = useRef(0);
+  // Debounce timer for handleScroll. Without this, every scroll event
+  // (60+/sec during a smooth animation or rapid wheel) re-evaluates the
+  // near-bottom heuristic, racing with batched log arrivals to flip
+  // autoScroll off mid-stream. See the auto-scroll race notes below.
+  const scrollDebounceRef = useRef(null);
 
   // Stabilize: if rawLogs is null/undefined/not-an-array, use the stable empty array
   // This prevents a new [] reference each render which would cause infinite re-render
@@ -54,25 +58,77 @@ export default function LogPanel({ logs: rawLogs, onClearLogs, settings, onSaveS
     return result;
   }, [logs, filter, verboseAlways]);
 
-  // Auto-scroll ONLY when new log lines are added (not on every render)
+  // Auto-scroll ONLY when new log lines are added (not on every render).
+  //
+  // Imperative scrollTop=scrollHeight (NOT scrollIntoView({behavior:"smooth"})):
+  //   - smooth animation runs ~500ms during which the browser fires scroll
+  //     events on every frame; each event triggers handleScroll which would
+  //     flip autoScroll off the moment new logs arrived mid-flight (because
+  //     scrollHeight grew but the animation is still aiming at the OLD bottom).
+  //   - imperative set is instant, doesn't generate phantom scroll events,
+  //     and lands precisely at the current bottom.
+  //   Mirrors SearchTab.jsx:170-174's working pattern for its log feed.
+  //
+  // requestAnimationFrame defers the scrollTop write until AFTER React has
+  // committed and the browser has laid out the new lines. Without this,
+  // containerRef.scrollHeight reflects the pre-render value and we'd land
+  // mid-content when a batch of 50+ lines arrives in one flush.
   useEffect(() => {
-    if (filteredLogs.length > prevLogCountRef.current && autoScroll && logEndRef.current) {
-      logEndRef.current.scrollIntoView({ behavior: "smooth" });
+    if (filteredLogs.length > prevLogCountRef.current && autoScroll && containerRef.current) {
+      const el = containerRef.current;
+      requestAnimationFrame(() => {
+        el.scrollTop = el.scrollHeight;
+      });
     }
     prevLogCountRef.current = filteredLogs.length;
   }, [filteredLogs.length, autoScroll]);
 
-  // Detect when user scrolls up manually
+  // Re-anchor prevLogCountRef whenever the visible-count basis changes
+  // (filter typed, verbose toggled). filteredLogs can SHRINK on these
+  // transitions (e.g. dropping verbose lines goes 200 → 50), and without
+  // a re-anchor the next "did logs grow?" check compares the new shrunk
+  // length against the stale 200 — fails the > test and never scrolls
+  // again until the count climbs past 200. Snap to bottom while we're
+  // here so the user's view doesn't jump to mid-scroll after the filter.
+  useEffect(() => {
+    prevLogCountRef.current = filteredLogs.length;
+    if (autoScroll && containerRef.current) {
+      const el = containerRef.current;
+      requestAnimationFrame(() => {
+        el.scrollTop = el.scrollHeight;
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter, verboseAlways]);
+
+  // Detect when user scrolls up manually.
+  //
+  // 200px (was 50px): a single mouse-wheel gesture or font-rendering reflow
+  // routinely crosses 50px, so the old threshold tripped on noise. The user
+  // has to scroll meaningfully up before we infer they're reading history.
+  //
+  // 150ms debounce: scroll events fire 60+/sec during animations and rapid
+  // wheel input. Re-evaluating on every event made the autoScroll state
+  // race with the 100ms log flush — batched lines could land between the
+  // user-scrolled-up snapshot and the auto-scroll back, leaving autoScroll
+  // permanently off. Coalescing to 150ms means we sample once per gesture.
   const handleScroll = () => {
     if (!containerRef.current) return;
-    const { scrollTop, scrollHeight, clientHeight } = containerRef.current;
-    const isNearBottom = scrollHeight - scrollTop - clientHeight < 50;
-    // Only update state if the value actually changed (prevents unnecessary re-renders)
-    setAutoScroll((prev) => {
-      if (prev === isNearBottom) return prev;
-      return isNearBottom;
-    });
+    if (scrollDebounceRef.current) clearTimeout(scrollDebounceRef.current);
+    scrollDebounceRef.current = setTimeout(() => {
+      const el = containerRef.current;
+      if (!el) return;
+      const { scrollTop, scrollHeight, clientHeight } = el;
+      const isNearBottom = scrollHeight - scrollTop - clientHeight < 200;
+      setAutoScroll((prev) => (prev === isNearBottom ? prev : isNearBottom));
+    }, 150);
   };
+
+  // Cleanup the debounce timer on unmount so a tab switch mid-gesture
+  // doesn't leave a pending callback pointing at a stale containerRef.
+  useEffect(() => () => {
+    if (scrollDebounceRef.current) clearTimeout(scrollDebounceRef.current);
+  }, []);
 
   const handleCopy = () => {
     const text = filteredLogs.map((e) => `[${e.timestamp}] ${e.line}`).join("\n");
@@ -127,7 +183,13 @@ export default function LogPanel({ logs: rawLogs, onClearLogs, settings, onSaveS
             size="sm"
             onClick={() => {
               setAutoScroll(true);
-              logEndRef.current?.scrollIntoView({ behavior: "smooth" });
+              // Imperative set, same reason as the auto-scroll effect:
+              // smooth animation would generate scroll events during which
+              // handleScroll could flip autoScroll back off when log lines
+              // grow scrollHeight mid-animation. Imperative + rAF lands
+              // exactly at the current bottom in one frame.
+              const el = containerRef.current;
+              if (el) requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; });
             }}
             title="Scroll to bottom"
           >
@@ -204,7 +266,6 @@ export default function LogPanel({ logs: rawLogs, onClearLogs, settings, onSaveS
             })}
           </div>
         )}
-        <div ref={logEndRef} />
       </div>
     </div>
   );
