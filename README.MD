@@ -82,7 +82,8 @@ lxml
 Pillow
 pypdf
 requests
-playwright>=1.40.0    # MangaFire VRF generation, image-quality probe
+patchright>=1.40.0    # Superseeds playwright
+[playwright>=1.40.0   # MangaFire VRF generation, image-quality probe]
 rapidfuzz             # Cross-site search title matching
 pywidevine            # Kagane DRM (optional; install only if using Kagane)
 cryptography          # Pywidevine dependency
