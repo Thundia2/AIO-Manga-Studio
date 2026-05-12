@@ -152,6 +152,28 @@ export default function SettingsTab({ settings, onSave }) {
       // --scaling 100. The downloader.js boolMap handles the negative-form
       // flag emission. Only meaningful for --format cbz.
       cbzPreserveOriginals: true,
+      // Komikku-compatible per-chapter CBZ output (2026-05-12, komikkuspec.md).
+      // When ON, Python auto-coerces --format cbz --keep-chapters
+      // --no-final-file and writes per-chapter ComicInfo.xml + cover.jpg
+      // + details.json at <out>/mangas/<Series>/. The format selector
+      // above is effectively ignored when this is on (Python prints a
+      // [Komikku] coercion notice in the log). DownloadTab's DEFAULT_FORM
+      // spread picks this up via the useEffect at line ~120-124; App.jsx's
+      // search/library wrappers spread it into queueDownload args.
+      komikku: false,
+      // LINE Webtoon WebP recompression defaults (Phase 1, 2026-05-11).
+      // When enabled here, BOTH the New tab AND search/library-initiated
+      // downloads inherit these knobs: the New tab's DEFAULT_FORM spread
+      // (DownloadTab.jsx:~110) and App.jsx's settings.defaults spread for
+      // the search/library onStartDownload wrappers (App.jsx:~155 and
+      // :~192) both pick this up. Master toggle is off by default so
+      // existing user flows are unchanged; toggling on in Settings makes
+      // every new webtoons.com download recompress without per-job UI.
+      // Silently no-ops for non-webtoons.com handlers (Python checks
+      // handler.name === "linewebtoon" before the encode pass).
+      webtoonRecompress: false,
+      webtoonRecompressQuality: 85,
+      webtoonRecompressMethod: 4,
     },
     // Per-search defaults — read by SearchTab on mount via the same
     // settings.searchOpts namespace. Surfaced here so the user has one
@@ -224,6 +246,14 @@ export default function SettingsTab({ settings, onSave }) {
         cbzPreserveOriginals: true,
         multiSource: false,
         multiSourceQualityMin: 0.65,
+        // Mirror webtoonRecompress* initial-state defaults so Reset clears
+        // them too. See the rationale block in the initial useState above.
+        webtoonRecompress: false,
+        webtoonRecompressQuality: 85,
+        webtoonRecompressMethod: 4,
+        // Komikku-mode default. Reset mirrors initial-state; see the
+        // rationale block in the initial useState above.
+        komikku: false,
       },
       searchOpts: { ...DEFAULT_SEARCH_OPTS },
     }));
@@ -482,6 +512,39 @@ export default function SettingsTab({ settings, onSave }) {
           <Switch
             checked={local.defaults.cbzPreserveOriginals !== false}
             onCheckedChange={(v) => setDefault("cbzPreserveOriginals", v)}
+          />
+        </div>
+
+        {/* Komikku output toggle (2026-05-12, komikkuspec.md).
+            When ON, Python force-coerces --format cbz / --keep-chapters /
+            --no-final-file regardless of the Format selector above. Each
+            chapter CBZ gets its own ComicInfo.xml (overrides filename-derived
+            chapter number / title / scanlator in Komikku v1.13.5+), plus
+            cover.jpg + details.json at the series-folder root. Output stays
+            at <workingDir>/mangas/<Series>/ — user syncs to phone's
+            <Komikku-SAF>/local/ themselves. DownloadTab's useEffect spreads
+            settings.defaults into its form on mount, so toggling here
+            propagates to every new download. */}
+        <SectionHeader>Komikku Output</SectionHeader>
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex-1">
+            <Label className="text-xs cursor-pointer">
+              Write Komikku-compatible per-chapter CBZs
+            </Label>
+            <p className="text-[10px] text-muted-foreground mt-0.5">
+              Each chapter is its own CBZ with a per-chapter{" "}
+              <span className="font-mono">ComicInfo.xml</span> (chapter number,
+              title, scanlator, web URL, upload date). Series folder also gets{" "}
+              <span className="font-mono">cover.jpg</span> +{" "}
+              <span className="font-mono">details.json</span> (status, genres,
+              authors). Forces format=CBZ, keep-chapters, no-final-file.
+              Output stays at <span className="font-mono">mangas/&lt;Series&gt;/</span>;
+              sync that into Komikku's storage root yourself.
+            </p>
+          </div>
+          <Switch
+            checked={!!local.defaults.komikku}
+            onCheckedChange={(v) => setDefault("komikku", v)}
           />
         </div>
 
@@ -787,6 +850,91 @@ export default function SettingsTab({ settings, onSave }) {
               className="w-20 shrink-0 font-mono tabular-nums"
             />
           </div>
+        </div>
+
+        {/* LINE Webtoon WebP Recompression (Phase 1, 2026-05-11) ──
+            webtoons.com-only image recompression. Targets the ~45GB-per-
+            series problem caused by archival-quality lossless PNGs on
+            newer chapters (verified: Eleceed Ch 57 → 91% smaller at q85).
+            Python-side `handler.name === "linewebtoon"` gates the actual
+            re-encode pass, so these defaults are safe to enable for users
+            with mixed-site libraries — non-webtoons downloads silently
+            skip the recompression pass. App.jsx's settings.defaults spread
+            for search/library wrappers (:155, :192) AND DownloadTab's
+            DEFAULT_FORM merge (:110-113) both pick these up. */}
+        <SectionHeader>LINE Webtoon Recompression</SectionHeader>
+        <p className="text-[10px] text-muted-foreground -mt-1 mb-2 leading-snug">
+          Re-encode webtoons.com <em className="not-italic font-semibold">lossless PNG</em> pages
+          to lossy WebP before packaging — only fires when the active handler is{" "}
+          <span className="font-mono">linewebtoon</span>, silently ignored for
+          every other site. Skips JPEG-served chapters automatically
+          (webtoons.com only ships PNG once a series gets popular — Eleceed
+          flips at Ch 57; recompressing the small early JPEGs would be
+          generation-loss for ~50 KB of savings). Typical impact on a
+          PNG-heavy series: 45 GB → ~5 GB at q85. Requires CBZ or EPUB output;
+          PDF is rejected at startup.
+        </p>
+        <div className="space-y-3">
+          <div className="flex items-start gap-3">
+            <Switch
+              checked={!!local.defaults.webtoonRecompress}
+              onCheckedChange={(v) => setDefault("webtoonRecompress", v)}
+              className="mt-0.5"
+            />
+            <div className="flex-1">
+              <Label className="text-xs cursor-pointer">
+                Recompress webtoons.com pages to WebP
+              </Label>
+              <p className="text-[10px] text-muted-foreground mt-0.5">
+                Applies to every webtoons.com download — direct URL, search-
+                initiated, and library re-downloads.
+              </p>
+            </div>
+          </div>
+          {local.defaults.webtoonRecompress && (
+            <div className="pl-12 animate-slide-up grid grid-cols-2 gap-x-6 gap-y-3">
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <Label className="text-xs">Quality</Label>
+                  <Badge variant="secondary" className="font-mono tabular-nums">
+                    {local.defaults.webtoonRecompressQuality ?? 85}
+                  </Badge>
+                </div>
+                <Slider
+                  value={local.defaults.webtoonRecompressQuality ?? 85}
+                  onValueChange={(v) => setDefault("webtoonRecompressQuality", v)}
+                  min={1}
+                  max={100}
+                />
+                <p className="text-[10px] text-muted-foreground mt-1 leading-snug">
+                  <span className="font-mono">85</span> = storage-optimized
+                  (default). <span className="font-mono">90</span> =
+                  archival-safe (~60% larger files). Above 95 is wasted
+                  bytes on color webtoon content.
+                </p>
+              </div>
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <Label className="text-xs">Encoder effort</Label>
+                  <Badge variant="secondary" className="font-mono tabular-nums">
+                    {local.defaults.webtoonRecompressMethod ?? 4}
+                  </Badge>
+                </div>
+                <Slider
+                  value={local.defaults.webtoonRecompressMethod ?? 4}
+                  onValueChange={(v) => setDefault("webtoonRecompressMethod", v)}
+                  min={0}
+                  max={6}
+                />
+                <p className="text-[10px] text-muted-foreground mt-1 leading-snug">
+                  <span className="font-mono">0</span> = fastest,{" "}
+                  <span className="font-mono">6</span> = smallest. Default
+                  4 is the sweet spot; 6 buys ~5% smaller files at ~2-3×
+                  the encode time — fine for overnight bulk runs.
+                </p>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Default Search Options ─────────────────────────────────

@@ -2187,6 +2187,146 @@ def save_final_images(
 
 
 # -----------------------------------------------------------
+# WebP recompression (LINE Webtoon, opt-in via --webtoon-recompress)
+# -----------------------------------------------------------
+def recompress_chapter_images_to_webp(
+    raw_paths: List[str],
+    quality: int,
+    method: int,
+) -> List[str]:
+    """Re-encode lossless PNG source images to lossy WebP at the given quality
+    and encoder method, replacing files in place.
+
+    Used by the LINE Webtoon pipeline (handler.name == 'linewebtoon') to
+    convert webtoons.com's CDN-served lossless PNG (~2-3 MB/page) to
+    storage-optimized WebP (~80-130 KB/page) before the CBZ fast-path or
+    EPUB packager consumes raw_paths.
+
+    Per-file behavior:
+      - .png sources: decoded via PIL, saved as WebP with quality + method,
+        original then removed. Returns the new .webp path in the same slot
+        of the output list.
+      - .jpg / .jpeg / .webp / .avif / .gif / .heic sources: skipped.
+        webtoons.com only serves JPEG for low-popularity series (Eleceed Ch
+        1-56 was JPEG, Ch 57+ flipped to lossless PNG once the series got
+        popular). Those JPEGs are already small (~50-350 KB total) AND lossy
+        — re-encoding them to WebP would be generation-loss for tiny savings.
+        The actual ~45 GB-per-series problem is the PNG chapters; we target
+        those specifically. Same skip reasoning for other already-lossy
+        formats. Returns the original path unchanged.
+      - Decode failures (corrupt files, DecompressionBomb): logged via
+        log_verbose, original path kept. Caller still packages the chapter
+        with that page's original bytes.
+
+    Concurrency: cpu // 2 workers, matching save_final_images (lines
+    2166-2168). libwebp releases the GIL during native encode so per-image
+    saves run in parallel.
+
+    Atomicity: <base>.webp is written first; only on success do we os.remove
+    the original. A crash mid-conversion can leave .webp next to the old
+    ext — the next inline retry wipes the chapter dir
+    (_process_chapter_strict ~line 5518) so leftover state is self-healing.
+
+    Cross-file: read by _process_chapter_impl ~line 5559 (between the
+    --keep-images copytree and the processed_tdir setup); the result becomes
+    raw_image_paths for the rest of the chapter pipeline. CBZ fast-path
+    (~line 5632) and EPUB chapter_content build (~line 5836) honor per-file
+    extensions via os.path.splitext, so .webp arcnames flow through. Resume
+    gating: webtoon_recompress / _quality / _method are in
+    _RESUME_GATING_DESTS — changing any invalidates the on-disk images.
+    """
+    if not raw_paths:
+        return list(raw_paths)
+
+    # Source extensions that benefit from WebP re-encode. PNG only because
+    # webtoons.com's JPEG-served chapters are already small AND already lossy
+    # (the CDN flips low-popularity series to JPEG q90); recompressing them
+    # would be generation-loss for ~50KB of savings per page. The real
+    # storage win is the PNG chapters (~2-3 MB → ~80-130 KB at q85).
+    _ELIGIBLE = {".png"}
+
+    def _convert_one(entry: Tuple[int, str]) -> Tuple[int, str]:
+        idx, src = entry
+        ext = os.path.splitext(src)[1].lower()
+        if ext not in _ELIGIBLE:
+            log_debug(
+                f"    Recompress skip (already {ext}): {os.path.basename(src)}"
+            )
+            return idx, src
+
+        base, _ = os.path.splitext(src)
+        dst = base + ".webp"
+        try:
+            with Image.open(src) as im:
+                # WebP encode wants RGB or L; webtoon pages are color so
+                # almost always already RGB, but be defensive against PNG
+                # palette / RGBA modes from older site formats.
+                if im.mode not in ("RGB", "L"):
+                    im = im.convert("RGB")
+                im.save(
+                    dst,
+                    format="WebP",
+                    quality=quality,
+                    method=method,
+                )
+        except Exception as e:
+            # PIL.UnidentifiedImageError ⊂ OSError; DecompressionBombError ⊂
+            # Exception. Broad catch keeps a single corrupt page from
+            # aborting the whole chapter — we keep the original instead.
+            log_verbose(
+                f"  Warning: WebP recompress failed for "
+                f"{os.path.basename(src)}: {e}. Keeping original."
+            )
+            try:
+                os.remove(dst)
+            except OSError:
+                pass
+            return idx, src
+
+        try:
+            os.remove(src)
+        except OSError as e:
+            # The new .webp is fine; we just couldn't delete the old file
+            # (locked by AV, OneDrive sync, etc). Return the .webp anyway;
+            # the leftover original gets wiped on the next chapter-dir reset.
+            log_debug(
+                f"    Recompress: kept original alongside webp ({e}): "
+                f"{os.path.basename(src)}"
+            )
+        return idx, dst
+
+    cpu = os.cpu_count() or 4
+    half_cores = max(1, cpu // 2)
+    workers = max(1, min(half_cores, len(raw_paths)))
+
+    out: List[Optional[str]] = [None] * len(raw_paths)
+    with _cpu_guard("recompress_webp"):
+        if workers == 1 or len(raw_paths) == 1:
+            for entry in enumerate(raw_paths):
+                idx, dst = _convert_one(entry)
+                out[idx] = dst
+                if idx % 8 == 0:
+                    _hb("cpu", f"recompress {idx+1}/{len(raw_paths)}")
+        else:
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="webp-recompress"
+            ) as pool:
+                # pool.map preserves submission order; consumed iteratively
+                # so memory stays bounded. _hb every 8 keeps the per-chapter
+                # watchdog satisfied on long chapters (60+ pages).
+                for idx, dst in pool.map(
+                    _convert_one, list(enumerate(raw_paths))
+                ):
+                    out[idx] = dst
+                    if idx % 8 == 0:
+                        _hb("cpu", f"recompress {idx+1}/{len(raw_paths)}")
+
+    # No None entries possible by construction (every _convert_one returns
+    # idx, str); the cast keeps mypy quiet.
+    return [p for p in out if p is not None]
+
+
+# -----------------------------------------------------------
 # Builders (PDF, EPUB, CBZ)
 # -----------------------------------------------------------
 def _media(path: str):
@@ -2238,6 +2378,240 @@ def build_comic_info_xml(
     return xml_template
 
 
+# -----------------------------------------------------------
+# Komikku-mode helpers (--komikku, see komikkuspec.md)
+# -----------------------------------------------------------
+# These three helpers exist exclusively to produce Komikku/Mihon/Tachiyomi-
+# compatible per-chapter CBZ output. They are zero-cost on non-Komikku runs
+# (never called). Cross-file coupling: the call sites live in main() inside
+# the cbz-cache creation block (grep 'cached_cbz_path = os.path.join') and
+# the --keep-chapters destination filename build (grep 'ch_suffix = f"Ch ').
+# See plan file at C:\Users\legoc\.claude\plans\we-will-be-making-idempotent-parnas.md
+
+def _komikku_status_to_digit(status_str: Optional[str]) -> str:
+    """Map a per-handler status string to Komikku's 0-6 enum digit (string).
+
+    Spec §6.1: details.json `status` field is a JSON string containing one
+    digit. 0=Unknown, 1=Ongoing, 2=Completed, 3=Licensed, 4=Publishing
+    finished, 5=Cancelled, 6=On hiatus. Komikku tolerates out-of-range
+    integers by collapsing to 0.
+
+    Source-side strings are normalized to lowercase. Variants per
+    sites/*.py: "Ongoing"/"Releasing" → 1, "Completed"/"Finished" → 2,
+    "Licensed" → 3, "Cancelled" → 5, "Hiatus"/"On Hiatus" → 6. Unknown
+    or empty falls through to "0".
+    """
+    if not status_str:
+        return "0"
+    s = str(status_str).strip().lower()
+    if s in ("ongoing", "releasing", "publishing", "active"):
+        return "1"
+    if s in ("completed", "finished", "complete", "ended"):
+        return "2"
+    if s == "licensed":
+        return "3"
+    if s in ("publishing finished", "publishingfinished"):
+        return "4"
+    if s in ("cancelled", "canceled", "dropped", "discontinued"):
+        return "5"
+    if s in ("hiatus", "on hiatus", "on_hiatus", "onhiatus", "paused"):
+        return "6"
+    return "0"
+
+
+def build_per_chapter_comic_info_xml(
+    series_title: str,
+    chapter_title: Optional[str],
+    chapter_num: Any,
+    volume: Optional[Any],
+    scanlator: Optional[str],
+    web_url: Optional[str],
+    uploaded_epoch: Optional[Any],
+    comic_info: Dict,
+    publishers: List[str],
+    lang: str,
+    page_count: int,
+) -> str:
+    """Per-chapter ComicInfo.xml string for Komikku-mode CBZs.
+
+    Spec §6.2: Komikku v1.13.5+ reads <Number>/<Title>/<Translator>/<Series>
+    from a ComicInfo.xml at the archive root and these OVERRIDE filename-
+    derived metadata. <Year>/<Month>/<Day> compose to SChapter.date_upload
+    (falls back to file mtime if absent — so we omit the tags when the
+    handler didn't supply an upload epoch).
+
+    Empty/None fields are omitted entirely (not emitted as empty tags) so
+    Komikku falls back cleanly to ChapterRecognition where we don't have
+    data — vs. an empty <Title/> which would suppress the regex.
+    """
+    def escape(s):
+        return xml.sax.saxutils.escape(str(s)) if s not in (None, "") else ""
+
+    authors = ", ".join(comic_info.get("authors", []) or [])
+    artists = ", ".join(comic_info.get("artists", []) or [])
+    publisher = ", ".join(publishers or [])
+    description = comic_info.get("desc", "") or ""
+
+    tags: List[str] = []
+    for key in ("genres", "theme", "format"):
+        if comic_info.get(key):
+            tags.extend(comic_info[key])
+    # Sorted for stable XML output (test/diff friendly); set() dedupes.
+    genre = ", ".join(sorted(set(tags))) if tags else ""
+
+    # Year/Month/Day from uploaded epoch. Many handlers store 0 as a
+    # sentinel for "unknown" (e.g. mangafire.py); treat 0 as missing.
+    # Use time.gmtime (UTC) — Komikku doesn't care about TZ; mtime
+    # fallback would itself be filesystem-local anyway.
+    year = month = day = None
+    if uploaded_epoch:
+        try:
+            epoch_int = int(uploaded_epoch)
+            if epoch_int > 0:
+                tm = time.gmtime(epoch_int)
+                year, month, day = tm.tm_year, tm.tm_mon, tm.tm_mday
+        except (TypeError, ValueError, OverflowError, OSError):
+            # OSError on Windows for epochs outside 1970-3000 range.
+            pass
+
+    # Render <Number> as plain decimal — strip trailing ".0" on integers.
+    num_str = ""
+    if chapter_num not in (None, ""):
+        try:
+            nf = float(chapter_num)
+            num_str = str(int(nf)) if nf.is_integer() else f"{nf:g}"
+        except (TypeError, ValueError):
+            num_str = str(chapter_num)
+
+    vol_str = ""
+    if volume not in (None, "", 0, "0"):
+        try:
+            vf = float(volume)
+            vol_str = str(int(vf)) if vf.is_integer() else f"{vf:g}"
+        except (TypeError, ValueError):
+            vol_str = str(volume)
+
+    lines: List[str] = [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<ComicInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">',
+        f'  <Series>{escape(series_title)}</Series>',
+    ]
+    if chapter_title:
+        lines.append(f'  <Title>{escape(chapter_title)}</Title>')
+    if num_str:
+        lines.append(f'  <Number>{escape(num_str)}</Number>')
+    if vol_str:
+        lines.append(f'  <Volume>{escape(vol_str)}</Volume>')
+    if description:
+        lines.append(f'  <Summary>{escape(description)}</Summary>')
+    if authors:
+        lines.append(f'  <Writer>{escape(authors)}</Writer>')
+    if artists:
+        lines.append(f'  <Penciller>{escape(artists)}</Penciller>')
+    if publisher:
+        lines.append(f'  <Publisher>{escape(publisher)}</Publisher>')
+    if scanlator:
+        lines.append(f'  <Translator>{escape(scanlator)}</Translator>')
+    if genre:
+        lines.append(f'  <Genre>{escape(genre)}</Genre>')
+    if web_url:
+        lines.append(f'  <Web>{escape(web_url)}</Web>')
+    if lang:
+        lines.append(f'  <LanguageISO>{escape(lang)}</LanguageISO>')
+    if year is not None:
+        lines.append(f'  <Year>{year}</Year>')
+        lines.append(f'  <Month>{month}</Month>')
+        lines.append(f'  <Day>{day}</Day>')
+    lines.append(f'  <PageCount>{int(page_count) if page_count else 0}</PageCount>')
+    lines.append('</ComicInfo>')
+    return "\n".join(lines) + "\n"
+
+
+def _komikku_chapter_filename(chap: Any, vol: Any, title: Optional[str]) -> str:
+    """Build a Komikku-friendly chapter filename: Vol.{vv} Ch.{ccc} - {title}.cbz.
+
+    Spec §8 + recommendation 7: this layout is parsed correctly by Mihon's
+    ChapterRecognition regex set (vol/ch prefixes stripped, decimal numbers
+    preserved) AND remains readable inside any file manager. ComicInfo.xml
+    <Number>/<Title> override these on read, so the filename is mostly
+    cosmetic — but it should still be parseable for cross-reader fallback.
+
+    - Volume: omit the `Vol.{vv} ` prefix when missing/0; otherwise 2-digit
+      zero-pad on integer parts.
+    - Chapter: integer part zero-pad to 3 digits (5 → "005", 100 → "100",
+      1200 → "1200"). Decimal portion kept verbatim (5.5 → "005.5") —
+      crucially NOT subjected to format_chap_for_filename's '~' substitution
+      which would break ChapterRecognition's decimal parser.
+    - Title: appended only if non-empty AND distinct from the chap label
+      itself (some handlers set ch["title"] == str(ch["chap"])).
+    """
+    # Chapter number → padded label
+    chap_label = ""
+    try:
+        cf = float(chap)
+        int_part = int(cf)
+        if cf.is_integer():
+            chap_label = f"{int_part:03d}" if int_part < 1000 else str(int_part)
+        else:
+            # Strip Python's float repr trailing noise: 5.5 → "5.5", 12.1 → "12.1".
+            # Format with %g then split, in case repr gives 5.500000000000001
+            # (rare but real on some platforms).
+            formatted = f"{cf:g}"  # e.g. "5.5", "12.1", "5"
+            if "." in formatted:
+                int_token, frac_token = formatted.split(".", 1)
+                int_for_pad = abs(int(int_token))
+                int_str = (
+                    f"{int_for_pad:03d}" if int_for_pad < 1000 else str(int_for_pad)
+                )
+                if int_token.startswith("-"):
+                    int_str = "-" + int_str
+                chap_label = f"{int_str}.{frac_token}"
+            else:
+                chap_label = (
+                    f"{int_part:03d}" if int_part < 1000 else str(int_part)
+                )
+    except (TypeError, ValueError):
+        # Non-numeric chap (e.g. "Prologue", "Extra"). Sanitize for filesystem
+        # safety but keep the original token — ChapterRecognition will fail
+        # to extract a number and Komikku will sort the chapter to the bottom
+        # (chapter_number = -1.0), which is correct for non-numeric chapters.
+        chap_label = _sanitize_folder_component(str(chap or "")) or "000"
+
+    # Volume → padded prefix or empty
+    vol_prefix = ""
+    if vol not in (None, "", 0, "0"):
+        try:
+            vf = float(vol)
+            vint = int(vf)
+            if vf.is_integer():
+                vol_prefix = f"Vol.{vint:02d} "
+            else:
+                vol_prefix = f"Vol.{vf:g} "
+        except (TypeError, ValueError):
+            v_sanitized = _sanitize_folder_component(str(vol))
+            if v_sanitized:
+                vol_prefix = f"Vol.{v_sanitized} "
+
+    # Title suffix → "" or " - {title}"
+    title_suffix = ""
+    if title:
+        t_raw = str(title).strip()
+        # Skip when the title duplicates the chap number in any obvious form.
+        # Compare against str(chap), the padded label, and the bare-int form.
+        try:
+            bare_int = str(int(float(chap)))
+        except (TypeError, ValueError):
+            bare_int = ""
+        skip_set = {str(chap or "").strip(), chap_label, bare_int}
+        if t_raw and t_raw not in skip_set:
+            t_clean = _sanitize_folder_component(t_raw)
+            if t_clean and t_clean not in skip_set:
+                title_suffix = f" - {t_clean}"
+
+    return f"{vol_prefix}Ch.{chap_label}{title_suffix}.cbz"
+
+
 def build_cbz(
     slices: List[str],
     out_path: str,
@@ -2245,9 +2619,19 @@ def build_cbz(
     comic_info: Dict,
     publishers: List[str],
     lang: str,
+    chapter_comic_info_xml: Optional[str] = None,
 ):
-    """Builds a CBZ file from a list of image slices with metadata."""
-    xml_content = build_comic_info_xml(
+    """Builds a CBZ file from a list of image slices with metadata.
+
+    chapter_comic_info_xml: when provided, used in place of the series-level
+    ComicInfo.xml that build_comic_info_xml would generate. Used by the
+    legacy --keep-chapters fallback path in --komikku mode to inject the
+    per-chapter ComicInfo.xml (the cbz_cache fast-path embeds the same XML
+    at cache-creation time; this is the slow-path equivalent for pre-Phase-D
+    resumes where chapter_content carries 'image' entries instead of
+    'cbz_cache' entries).
+    """
+    xml_content = chapter_comic_info_xml or build_comic_info_xml(
         title, comic_info, publishers, lang, len(slices)
     )
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_STORED) as zf:
@@ -2889,6 +3273,20 @@ _RESUME_GATING_DESTS = frozenset({
     "width", "aspect_ratio",
     "quality", "scaling", "chapters", "group",
     "mix_by_upvote", "no_partials", "no_processing",
+    # Phase 1 (2026-05-11): LINE Webtoon WebP recompression. Changing any
+    # of these between runs invalidates the on-disk images because the
+    # conversion deletes the original PNG/JPEG bytes. See
+    # recompress_chapter_images_to_webp() and the call site near line 5559.
+    "webtoon_recompress",
+    "webtoon_recompress_quality",
+    "webtoon_recompress_method",
+    # Komikku-mode (komikkuspec.md, 2026-05-12): the cbz_cache CBZ at
+    # processed_tdir/{n}.cbz either contains the per-chapter ComicInfo.xml
+    # or doesn't, depending on Komikku-mode at create time. Flipping the
+    # toggle between runs must invalidate the cache so resumed chapters
+    # don't end up half-Komikku. See the cbz-cache creation block (grep
+    # 'cached_cbz_path = os.path.join') for where this matters.
+    "komikku",
 })
 
 # Dests that must NEVER be persisted to run_params.json. Every other
@@ -4021,13 +4419,172 @@ def main():
         "This flag forces the legacy decode/recombine/re-encode path even "
         "when no transform was requested.",
     )
+    # ── LINE Webtoon WebP recompression (Phase 1, 2026-05-11) ──
+    # Targets webtoons.com's archival-quality PNG output (~2-3 MB/page on
+    # newer Eleceed / TBATE chapters) which produced 40+ GB libraries. WebP
+    # q85 lands at ~80 KB/page on color webtoon content (visually equivalent
+    # on phone-screen viewing per user research) → ~95% size reduction. Only
+    # applies when handler.name == 'linewebtoon' AND --format is cbz/epub.
+    # See recompress_chapter_images_to_webp() and the call site near
+    # _process_chapter_impl's --keep-images block (grep 'webtoon_recompress').
+    p.add_argument(
+        "--webtoon-recompress",
+        action="store_true",
+        help="LINE Webtoon ONLY (handler.name == 'linewebtoon'): re-encode "
+             "lossless PNG pages to lossy WebP at --webtoon-recompress-quality "
+             "before packaging. JPEG-source chapters are skipped (webtoons.com "
+             "only serves JPEG for low-popularity series — those pages are "
+             "already small and recompressing them is generation-loss). "
+             "Targets the ~45GB per-series problem from the CDN's PNG output "
+             "on popular series; q85 typically lands at ~5-7%% of the "
+             "original library size with results indistinguishable from "
+             "source on phone-screen viewing of color webtoons. Requires "
+             "--format cbz or epub (PDF would re-encode the WebP as "
+             "FlateDecode and INCREASE size). Files are converted in place "
+             "in the tmp directory; original PNG bytes are not preserved on "
+             "disk (use --keep-images to retain a copy in "
+             "<out>/images/Chapter_<n>/). Changing the quality or method "
+             "between runs invalidates the tmp folder via resume gating.",
+    )
+    p.add_argument(
+        "--webtoon-recompress-quality",
+        type=int,
+        default=85,
+        choices=range(1, 101),
+        metavar="[1-100]",
+        help="WebP quality factor for --webtoon-recompress (default: 85). "
+             "85 = storage-optimized, indistinguishable from source on "
+             "phone-screen viewing of color webtoons. 90 = archival-safe "
+             "with insurance margin against zoom/high-DPI artifacts "
+             "(~60%% larger files). Values above 95 produce diminishing "
+             "returns for color content.",
+    )
+    p.add_argument(
+        "--webtoon-recompress-method",
+        type=int,
+        default=4,
+        choices=range(0, 7),
+        metavar="[0-6]",
+        help="libwebp encoder effort for --webtoon-recompress (default: 4). "
+             "0 = fastest/largest, 6 = slowest/smallest. method=4 matches "
+             "the existing WebP-lossless pool default (~line 2119); "
+             "method=6 trades ~2-3x encode time for ~5%% smaller files — "
+             "sensible for overnight bulk runs on a desktop, not phone CPUs.",
+    )
+    # ── Komikku-compatible per-chapter CBZ output (komikkuspec.md) ──
+    # Writes per-chapter CBZs with per-chapter ComicInfo.xml, plus
+    # cover.jpg and details.json at the series-folder root, matching the
+    # Mihon/Tachiyomi/Komikku LocalSource on-disk format. Force-coerces
+    # --format cbz --keep-chapters --no-final-file. Output path stays at
+    # <workingDir>/mangas/<Series>/ — sync to your phone's <Komikku-SAF>/
+    # local/ via SyncThing/rclone/manual copy. Helpers + spec details:
+    # grep '_komikku_status_to_digit\|build_per_chapter_comic_info_xml\|
+    # _komikku_chapter_filename'.
+    p.add_argument(
+        "--komikku",
+        action="store_true",
+        help="Write Komikku/Mihon/Tachiyomi-compatible per-chapter CBZs. "
+             "Each chapter gets its own ComicInfo.xml (with <Series>, "
+             "<Number>, <Translator>, <Web>, <Year>/<Month>/<Day>), plus "
+             "cover.jpg and details.json (status/genres/authors as a "
+             "JSON object) at the series-folder root. Auto-coerces "
+             "--format cbz --keep-chapters --no-final-file. Output "
+             "stays at <workingDir>/mangas/<Series>/ — sync into "
+             "<Komikku-SAF-root>/local/ yourself.",
+    )
     args = p.parse_args()
     _validate_resume_categories(p)  # fail-fast on dest typos / category overlap
     # -----------------------------
     # Argument sanity checks / modes
     # -----------------------------
+
+    # --komikku: silently coerce the three implementation flags that the
+    # Komikku output layout requires. Runs BEFORE the "no_final_file requires
+    # keep_chapters" check below so the implied keep_chapters=True satisfies
+    # it. The explicit notice keeps the spawn-line behavior obvious in the
+    # UI's LogPanel for users who toggle Komikku and then wonder why their
+    # format selector was ignored. Cross-file: UI counterparts are
+    # settings.defaults.komikku (SettingsTab.jsx) + form.komikku
+    # (DownloadTab.jsx); both emit --komikku via downloader.js boolMap.
+    if getattr(args, "komikku", False):
+        coerced_bits: List[str] = []
+        if args.format != "cbz":
+            coerced_bits.append(f"--format cbz (was {args.format})")
+            args.format = "cbz"
+        if not args.keep_chapters:
+            coerced_bits.append("--keep-chapters")
+            args.keep_chapters = True
+        if not args.no_final_file:
+            coerced_bits.append("--no-final-file")
+            args.no_final_file = True
+        if coerced_bits:
+            print(
+                f"[Komikku] Forcing { ' '.join(coerced_bits) } for spec-"
+                f"compliant per-chapter output."
+            )
+        else:
+            print("[Komikku] Per-chapter CBZ output enabled (spec-compliant).")
+
     if args.no_final_file and (not args.keep_chapters):
         p.error("--no-final-file requires --keep-chapters.")
+
+    # --webtoon-recompress compatibility checks. Run early so a multi-hour
+    # download isn't started just to discover --format pdf would have made
+    # the whole effort moot. The hard rejections cover combinations that
+    # are strictly worse than not using the flag at all (PDF/FlateDecode
+    # bloat, double-encode through Phase C save_final_images). Warnings
+    # cover combinations that compose but lose extra quality (double-decode
+    # paths) or defeat the disk-saving purpose (--keep-images).
+    if getattr(args, "webtoon_recompress", False):
+        if args.format == "pdf":
+            p.error(
+                "--webtoon-recompress is incompatible with --format pdf: "
+                "PDF embeds JPEG via /DCTDecode but decodes WebP into "
+                "uncompressed FlateDecode pixel data, which INCREASES file "
+                "size. Use --format cbz (recommended) or --format epub."
+            )
+        if args.format == "none":
+            p.error(
+                "--webtoon-recompress requires --format cbz or epub. With "
+                "--format none there is no archive file to write the "
+                "converted pages into."
+            )
+        if getattr(args, "no_cbz_preserve_originals", False):
+            p.error(
+                "--webtoon-recompress is incompatible with "
+                "--no-cbz-preserve-originals: the lossy WebP would be "
+                "decoded and re-encoded again as WebP-lossless via Phase C "
+                "auto-format, wrapping the lossy artifacts in a lossless "
+                "container — strictly worse than either option alone."
+            )
+        # Warnings (not errors) for combinations that compose but produce
+        # a double-encode loss. The user might know what they're doing.
+        if args.width is not None:
+            print(
+                "  [!] --webtoon-recompress with --width forces the slow "
+                "decode-resize-encode path; the output WebP will be "
+                "re-encoded (twice-lossy). Consider dropping --width.",
+                file=sys.stderr,
+            )
+        if args.aspect_ratio is not None:
+            print(
+                "  [!] --webtoon-recompress with --aspect-ratio forces the "
+                "slow decode-resize-encode path (twice-lossy).",
+                file=sys.stderr,
+            )
+        if args.scaling != 100:
+            print(
+                f"  [!] --webtoon-recompress with --scaling={args.scaling} "
+                "forces the slow decode-resize-encode path (twice-lossy).",
+                file=sys.stderr,
+            )
+        if args.keep_images:
+            print(
+                "  [i] --webtoon-recompress with --keep-images preserves "
+                "the original PNG/JPEG downloads alongside the recompressed "
+                "CBZ. Disable --keep-images to maximize disk savings.",
+                file=sys.stderr,
+            )
 
     # --search is checked before --list-chapters / build-final-file because it
     # resolves the URL, and the downstream modes' "URL required" check would
@@ -4940,6 +5497,53 @@ def main():
                 )
                 current_book_size += os.path.getsize(original_cover_path)
 
+    # ── Komikku series-level metadata (cover.jpg + details.json) ──
+    # Spec §5 + §6.1: cover.jpg at series-folder root, details.json with
+    # exact keys {title, author, artist, description, genre, status}.
+    # Written once per run, fresh-or-overwriting on resume so the on-disk
+    # metadata always reflects the latest comic_data (handler-extracted
+    # genres/status may improve between runs as handlers evolve).
+    # Cross-file: _komikku_status_to_digit (top of file, near
+    # build_per_chapter_comic_info_xml). The cover-prepend to
+    # current_book_content above is dead code in Komikku mode (we force
+    # --no-final-file so the final CBZ build never fires) but kept for
+    # parity with the non-Komikku CBZ path.
+    if getattr(args, "komikku", False):
+        try:
+            if original_cover_path and os.path.exists(original_cover_path):
+                cover_dst = os.path.join(out_dir, "cover.jpg")
+                # Use copy2 so the file appears with timestamps from the
+                # tmp copy (preserves mtime for Library-tab thumb-cache).
+                shutil.copy2(original_cover_path, cover_dst)
+                log_verbose(f"  Komikku: wrote cover.jpg → {cover_dst}")
+            details_payload = {
+                "title": title,
+                "author": ", ".join(comic_data.get("authors", []) or []),
+                "artist": ", ".join(comic_data.get("artists", []) or []),
+                "description": comic_data.get("desc") or "",
+                # Spec §6.1: `genre` is a JSON array of strings. Some
+                # handlers merge `theme`/`format` into adjacent fields;
+                # we keep `genre` as the canonical genres list only,
+                # since that's what Komikku renders as tag chips.
+                "genre": list(comic_data.get("genres", []) or []),
+                "status": _komikku_status_to_digit(comic_data.get("status")),
+            }
+            details_path = os.path.join(out_dir, "details.json")
+            with open(details_path, "w", encoding="utf-8") as f:
+                json.dump(details_payload, f, ensure_ascii=False, indent=2)
+            log_verbose(
+                f"  Komikku: wrote details.json (status={details_payload['status']}, "
+                f"{len(details_payload['genre'])} genre tags)"
+            )
+        except OSError as exc:
+            # Don't fail the whole run for a metadata-write error. The
+            # chapter CBZs still carry the same metadata via per-chapter
+            # ComicInfo.xml, so Komikku will still display the manga.
+            print(
+                f"[!] Komikku metadata write failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
     # --- Missed chapter logging + end-of-run retries ---
     retry_missed = not getattr(args, 'no_retry_missed_chapters', False)
     missed_retries = max(0, int(getattr(args, 'missed_retries', 2) or 0))
@@ -5556,6 +6160,52 @@ def main():
                     else:
                         shutil.copytree(tdir, dest_dir)
 
+            # Phase 1 (2026-05-11): LINE Webtoon WebP recompression.
+            # Mutates raw_image_paths in place — converted .webp files
+            # replace the original PNG/JPEG paths so both the CBZ fast
+            # path (~line 5910) and the slow path (~line 5965) see the
+            # already-compressed bytes. Runs AFTER --keep-images copytree
+            # so users opting into both get unconverted originals in
+            # <out>/images/ AND the recompressed CBZ.
+            #
+            # Gating:
+            #   * --webtoon-recompress was passed
+            #   * handler.name == "linewebtoon" (the LINE Webtoon handler;
+            #     multi-source fallback may swap `handler` via `nonlocal`,
+            #     in which case the check correctly evaluates against the
+            #     active source and skips recompression for non-webtoon
+            #     alt sources like mangadex)
+            #   * args.format in ("cbz", "epub") (PDF would re-encode as
+            #     FlateDecode and bloat; argparse validation already
+            #     rejects --format pdf at startup, but we re-check here
+            #     to be defensive against `--format none` and any other
+            #     odd-mode arrival)
+            #   * raw_image_paths is non-empty (defensive)
+            #
+            # Cross-file: argparse flags ~line 4070, _RESUME_GATING_DESTS
+            # ~line 2900, recompress_chapter_images_to_webp() ~line 2190.
+            if (
+                getattr(args, "webtoon_recompress", False)
+                and handler.name == "linewebtoon"
+                and args.format in ("cbz", "epub")
+                and raw_image_paths
+            ):
+                log_verbose(
+                    f"  [recompress] Converting {len(raw_image_paths)} pages "
+                    f"to WebP q{args.webtoon_recompress_quality} "
+                    f"method={args.webtoon_recompress_method}..."
+                )
+                _t0_recompress = time.monotonic()
+                raw_image_paths = recompress_chapter_images_to_webp(
+                    raw_image_paths,
+                    quality=args.webtoon_recompress_quality,
+                    method=args.webtoon_recompress_method,
+                )
+                log_verbose(
+                    f"  [recompress] Done in "
+                    f"{time.monotonic() - _t0_recompress:.1f}s."
+                )
+
             _t0_proc = time.monotonic()
             os.makedirs(processed_tdir, exist_ok=True)
 
@@ -5820,6 +6470,20 @@ def main():
                 # into the series-wide archive. Mirrors PDF's
                 # processed_tdir/{n}.pdf cache. Replaces chapter_content
                 # with a single cbz_cache entry pointing at the new archive.
+                #
+                # Komikku mode (2026-05-12, komikkuspec.md): when --komikku is
+                # set, embed a per-chapter ComicInfo.xml in the cache zip at
+                # creation time. The XML carries <Series>/<Number>/<Title>/
+                # <Translator>/<Web>/<Year>-<Month>-<Day>, which Komikku
+                # v1.13.5+ uses to override filename-derived metadata. The
+                # cache then becomes byte-identical to what the final
+                # destination CBZ needs, so the --keep-chapters block below
+                # carries the ComicInfo.xml across for free via shutil.copy2.
+                # build_cbz_from_content (series-level wrapper) explicitly
+                # filters ComicInfo.xml during member-copy, so writing it
+                # here doesn't pollute the eventual series archive — though
+                # in Komikku mode we force --no-final-file, so the series
+                # archive never gets built anyway.
                 if processed_page_images:
                     cached_cbz_path = os.path.join(processed_tdir, f"{n}.cbz")
                     with zipfile.ZipFile(
@@ -5827,6 +6491,25 @@ def main():
                     ) as zf:
                         for i, p in enumerate(processed_page_images):
                             zf.write(p, f"{i:04d}{os.path.splitext(p)[1]}")
+                        if getattr(args, "komikku", False):
+                            per_chap_xml = build_per_chapter_comic_info_xml(
+                                series_title=title,
+                                chapter_title=ch.get("title") or "",
+                                chapter_num=n,
+                                volume=ch.get("vol"),
+                                scanlator=grp_name,
+                                web_url=ch.get("url") or args.comic_url,
+                                uploaded_epoch=ch.get("uploaded"),
+                                comic_info=comic_data,
+                                publishers=[grp_name] if grp_name else [],
+                                lang=args.language,
+                                page_count=len(processed_page_images),
+                            )
+                            zf.writestr(
+                                "ComicInfo.xml",
+                                per_chap_xml,
+                                compress_type=zipfile.ZIP_DEFLATED,
+                            )
                     chapter_content = [
                         {"type": "cbz_cache", "path": cached_cbz_path}
                     ]
@@ -5938,8 +6621,20 @@ def main():
             return None, grp_name, n, 0
 
         if args.keep_chapters:
-            ch_suffix = f"Ch {format_chap_for_filename(n)}"
-            ch_filename = f"{join_name(base_filename, ch_suffix)}.{args.format}"
+            # Komikku mode: filename adopts Vol.{vv} Ch.{ccc} - {title}.cbz
+            # (spec recommendation 7) which Mihon's ChapterRecognition parses
+            # correctly AND is human-readable. We drop the series-title
+            # prefix because the parent folder already IS the title under
+            # Komikku's <SAF-root>/local/<Title>/ convention.
+            # See _komikku_chapter_filename for padding/decimal rules.
+            if getattr(args, "komikku", False):
+                ch_filename = _komikku_chapter_filename(
+                    n, ch.get("vol"), ch.get("title")
+                )
+                ch_suffix = f"Ch {format_chap_for_filename(n)}"  # logging only
+            else:
+                ch_suffix = f"Ch {format_chap_for_filename(n)}"
+                ch_filename = f"{join_name(base_filename, ch_suffix)}.{args.format}"
             ch_out_path = os.path.join(out_dir, ch_filename)
             ch_title = f"{title} ({ch_suffix})"
             log_verbose(f"  Saving individual chapter file...")
@@ -5965,6 +6660,9 @@ def main():
                 # parallel `elif args.format == "pdf"` block below — the
                 # cache is byte-identical to what build_cbz would have
                 # written, so the copy is correct AND skips a re-zip.
+                # In --komikku, the cache already carries the per-chapter
+                # ComicInfo.xml from the cache-create block above, so the
+                # copy ports it across unchanged.
                 if (
                     chapter_content
                     and chapter_content[0].get("type") == "cbz_cache"
@@ -5981,12 +6679,29 @@ def main():
                     print(f"CBZ saved → {os.path.basename(ch_out_path)}")
                 else:
                     # Legacy back-compat: chapter_content carries 'image'
-                    # entries (pre-Phase-D code path). Build directly.
+                    # entries (pre-Phase-D code path). Build directly. In
+                    # --komikku, pass the per-chapter ComicInfo.xml so this
+                    # slow path matches the fast-path output byte-for-byte.
                     cbz_images = [
                         item["path"]
                         for item in chapter_content
                         if item.get("type") == "image"
                     ]
+                    chapter_xml = None
+                    if getattr(args, "komikku", False):
+                        chapter_xml = build_per_chapter_comic_info_xml(
+                            series_title=title,
+                            chapter_title=ch.get("title") or "",
+                            chapter_num=n,
+                            volume=ch.get("vol"),
+                            scanlator=grp_name,
+                            web_url=ch.get("url") or args.comic_url,
+                            uploaded_epoch=ch.get("uploaded"),
+                            comic_info=comic_data,
+                            publishers=[grp_name] if grp_name else [],
+                            lang=args.language,
+                            page_count=len(cbz_images),
+                        )
                     with _cpu_guard('build_cbz'):
                         build_cbz(
                             cbz_images,
@@ -5995,6 +6710,7 @@ def main():
                             comic_data,
                             [grp_name] if grp_name else [],
                             args.language,
+                            chapter_comic_info_xml=chapter_xml,
                         )
             elif args.format == "pdf":
                 if chapter_content:
