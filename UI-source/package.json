@@ -2,6 +2,11 @@
   "name": "aio-downloader-ui",
   "version": "1.7.1",
   "description": "Desktop UI for AIO Manga/Webtoon Downloader",
+  "author": {
+    "name": "Thundia2",
+    "email": "thundia2@gmail.com"
+  },
+  "homepage": "https://github.com/Thundia2/AIO-Manga-Studio",
   "main": "electron/main.js",
   "scripts": {
     "dev": "vite",
@@ -72,7 +77,6 @@
       "description": "Desktop app for downloading manga, webtoons, and comics from 50+ sites with cross-site search and quality ranking. Builds PDF, EPUB, or CBZ output (with optional Mihon/Komikku-compatible per-chapter CBZs). Bundles Python + Patchright Chromium for VRF-gated sources. Resume-safe by default; configurable per-host concurrency throttling on CDN errors."
     },
     "deb": {
-      "//": "Explicit dependency list — electron-builder's default `auto` mode misses Patchright/Chromium's transitive system libs, which then surface as 'failed to launch chromium' on Ubuntu Server / minimal Debian images. Pinned to package names that exist on Debian 11/12 and Ubuntu 20.04/22.04/24.04. libasound2|libasound2t64 alternation handles the Ubuntu 24.04 / Mint 22 t64 transition (libasound2 was renamed to libasound2t64 for the time_t ABI break — dpkg respects the pipe alternation).",
       "depends": [
         "libnss3",
         "libgbm1",
