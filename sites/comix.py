@@ -253,6 +253,7 @@ class ComixSiteHandler(BaseSiteHandler):
             "format": ["format"],
             "authors": ["authors", "author"],
             "artists": ["artists", "artist"],
+            "alt_names": ["alt_names", "alt_titles", "altTitles", "aliases", "alternative_names"],
         }
         for target_key, source_keys in list_mappings.items():
             for source_key in source_keys:
@@ -261,11 +262,20 @@ class ComixSiteHandler(BaseSiteHandler):
                     manga_data[target_key] = normalized
                     break
 
+        # Year may live under any of these depending on the comix.to API
+        # version. Guard tightly: only int values > 0; non-int payloads are
+        # silently dropped so downstream consumers always see a clean field.
+        for year_key in ("year", "release_year", "year_of_release"):
+            year_raw = manga_data.get(year_key)
+            if isinstance(year_raw, int) and year_raw > 0:
+                manga_data["year"] = year_raw
+                break
+
         return SiteComicContext(
             comic=manga_data,
             title=manga_data.get("title", "Unknown"),
             identifier=manga_data.get("hid") or manga_data.get("hash_id"),
-            soup=soup 
+            soup=soup
         )
 
     def get_chapters(

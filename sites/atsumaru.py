@@ -48,11 +48,6 @@ class AtsumaruSiteHandler(BaseSiteHandler):
             return f"{self._BASE_URL}/static/{poster}"
         return None
 
-    def _parse_people(self, entries: Optional[List[Dict]]) -> List[str]:
-        if not entries:
-            return []
-        return [entry.get("name") for entry in entries if entry.get("name")]
-
     # ----------------------------------------------------------- Base overrides
     def configure_session(self, scraper, args) -> None:
         scraper.headers.setdefault("Referer", f"{self._BASE_URL}/")
@@ -66,18 +61,48 @@ class AtsumaruSiteHandler(BaseSiteHandler):
         description = manga.get("synopsis")
         cover = self._parse_cover(manga)
 
+        # Genres live under `genres` (list of {id, name}), NOT `tags`. Reading
+        # `tags` silently returned [] before — visible on the site, missing in
+        # the --komikku details.json. Confirmed live against /api/manga/page.
         comic: Dict[str, object] = {
             "hid": slug,
             "title": title,
             "desc": description,
             "cover": cover,
-            "genres": [tag.get("name") for tag in manga.get("tags") or [] if tag.get("name")],
+            "genres": [g.get("name") for g in manga.get("genres") or [] if g.get("name")],
             "url": url,
         }
 
-        authors = self._parse_people(manga.get("authors"))
-        if authors:
-            comic["authors"] = authors
+        # `authors` entries carry type="Author"|"Artist". Split so details.json
+        # surfaces the artist separately instead of collapsing into authors.
+        raw_people = manga.get("authors") or []
+        authors_list = [
+            p.get("name") for p in raw_people
+            if isinstance(p, dict) and p.get("name") and p.get("type") != "Artist"
+        ]
+        artists_list = [
+            p.get("name") for p in raw_people
+            if isinstance(p, dict) and p.get("name") and p.get("type") == "Artist"
+        ]
+        if authors_list:
+            comic["authors"] = authors_list
+        if artists_list:
+            comic["artists"] = artists_list
+
+        # API returns "Ongoing"/"Completed" — covered by _komikku_status_to_digit.
+        status = manga.get("status")
+        if isinstance(status, str) and status:
+            comic["status"] = status
+
+        other_names = manga.get("otherNames")
+        if isinstance(other_names, list):
+            cleaned = [n for n in other_names if isinstance(n, str) and n]
+            if cleaned:
+                comic["alt_names"] = cleaned
+
+        release_year = manga.get("releaseYear")
+        if isinstance(release_year, int) and release_year > 0:
+            comic["year"] = release_year
 
         comic["language"] = "en"
 

@@ -232,6 +232,19 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
         status_node = soup.select_one(".post-status .summary-content, .status-content")
         status = status_node.get_text(strip=True) if status_node else "Unknown"
 
+        # Alt titles — MT skins surface them under `.seriestualt`. Splits on
+        # the usual separator zoo; deduped while preserving order. Skip year:
+        # MT's "Posted On" is the series-page creation date, not series start.
+        alt_titles: List[str] = []
+        for el in soup.select(".seriestualt"):
+            text = el.get_text(" ", strip=True)
+            if not text:
+                continue
+            for piece in re.split(r"[,;/|]", text):
+                p = piece.strip()
+                if p and p not in alt_titles:
+                    alt_titles.append(p)
+
         slug = url.rstrip("/").split("/")[-1]
         post_id_from_html = self._extract_post_id(html)
         api_data = None
@@ -253,7 +266,9 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
             "status": status,
             "url": url,
         }
-        
+        if alt_titles:
+            comic["alt_names"] = alt_titles
+
         comic["_raw_html"] = html
         if post_id_from_html:
             comic["_post_id"] = str(post_id_from_html)

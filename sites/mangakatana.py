@@ -103,6 +103,17 @@ class MangaKatanaSiteHandler(BaseSiteHandler):
             "url": url,
         }
 
+        # Alt names also surface here as a structured field. `_extract_description`
+        # ALREADY merges them into desc as "Alt names: ..." for human display;
+        # this second surfaces gives downstream consumers (Komikku details.json,
+        # ComicInfo.xml) a clean list.
+        alt_node = soup.select_one(".alt_name")
+        if alt_node:
+            alt_text = alt_node.get_text(" ", strip=True)
+            alt_list = [p.strip() for p in re.split(r"[;,/|]", alt_text) if p.strip()]
+            if alt_list:
+                comic["alt_names"] = alt_list
+
         status_text = soup.select_one(".value.status")
         if status_text:
             status = status_text.get_text(strip=True)

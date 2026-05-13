@@ -141,6 +141,10 @@ class FlameComicsSiteHandler(BaseSiteHandler):
             "_page_props": page_props, # Cache full props including chapters
         }
 
+        year_raw = series_data.get("year")
+        if isinstance(year_raw, int) and year_raw > 0:
+            comic["year"] = year_raw
+
         return SiteComicContext(
             comic=comic,
             title=title,

@@ -206,6 +206,14 @@ class MangaParkSiteHandler(BaseSiteHandler):
             "_series_id": node.get("id"),
         }
 
+        # Prefer uploadStatus (status of the scanlated upload — what users
+        # actually read) over originalStatus (status of the original-language
+        # publication). _komikku_status_to_digit handles the typical values
+        # ("ongoing"/"completed"/"hiatus"/"cancelled"/"pending").
+        status = data.get("uploadStatus") or data.get("originalStatus")
+        if isinstance(status, str) and status:
+            comic["status"] = status
+
         seed_path = None
         chapter_nodes = node.get("last_chapterNodes") or []
         if chapter_nodes:

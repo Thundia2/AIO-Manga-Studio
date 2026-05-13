@@ -114,6 +114,17 @@ class DynastySiteHandler(BaseSiteHandler):
         authors = [tag["name"] for tag in data.get("tags", []) if tag.get("type") == "Author"]
         if authors:
             comic["authors"] = authors
+        artists = [tag["name"] for tag in data.get("tags", []) if tag.get("type") == "Artist"]
+        if artists:
+            comic["artists"] = artists
+
+        # Aliases already merged into desc above for human-readable display;
+        # also surface as a structured field for the Komikku/ComicInfo pipeline.
+        aliases_raw = data.get("aliases")
+        if isinstance(aliases_raw, list):
+            cleaned = [a for a in aliases_raw if isinstance(a, str) and a]
+            if cleaned:
+                comic["alt_names"] = cleaned
 
         return SiteComicContext(comic=comic, title=title, identifier=slug, soup=None)
 

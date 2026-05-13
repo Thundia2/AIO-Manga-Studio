@@ -437,6 +437,23 @@ class MadaraSiteHandler(BaseSiteHandler):
         if genres:
             comic["genres"] = genres
 
+        # Madara theme exposes status under a `.post-content_item` row whose
+        # `.summary-heading` reads "Status" — reuse `_extract_people` (which
+        # walks exactly those rows) and take the first value. Cascades to
+        # every MadaraSiteHandler subclass that calls super().fetch_comic_context.
+        status_values = self._extract_people(soup, ("status",))
+        if status_values:
+            comic["status"] = status_values[0]
+
+        # Some Madara children expose "Release" or "Year of Release" as a
+        # post-content_item row. Pull the first 4-digit year out — guard
+        # tightly so noise (e.g. an updated-date row) doesn't bleed in.
+        year_values = self._extract_people(soup, ("release", "year"))
+        if year_values:
+            year_match = re.search(r"\b(\d{4})\b", year_values[0])
+            if year_match:
+                comic["year"] = int(year_match.group(1))
+
         comic["language"] = "en"
 
         return SiteComicContext(comic=comic, title=title, identifier=slug, soup=soup)

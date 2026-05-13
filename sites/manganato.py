@@ -160,18 +160,34 @@ class ManganatoSiteHandler(BaseSiteHandler):
             ],
         )
 
+        # Walk every metadata row once and dispatch by label substring. Each
+        # row is `<li><h2>Label:</h2>value</li>` — we strip the leading
+        # label-colon and split per-field.
         authors: List[str] = []
+        status: Optional[str] = None
+        year: Optional[int] = None
+        alt_names: List[str] = []
         for item in soup.select(".manga-info-text li"):
             label = item.find("h2")
             if not label:
                 continue
             label_text = label.get_text(strip=True).lower()
+            content = item.get_text(" ", strip=True)
+            if ":" not in content:
+                continue
+            value = content.split(":", 1)[1].strip()
+            if not value:
+                continue
             if "author" in label_text:
-                content = item.get_text(" ", strip=True)
-                parts = content.split(":", 1)
-                if len(parts) == 2:
-                    authors = [a.strip() for a in parts[1].split(",") if a.strip()]
-                break
+                authors = [a.strip() for a in value.split(",") if a.strip()]
+            elif "status" in label_text:
+                status = value
+            elif "released" in label_text or "published" in label_text or "year" in label_text:
+                year_match = re.search(r"\b(\d{4})\b", value)
+                if year_match:
+                    year = int(year_match.group(1))
+            elif "alternative" in label_text or "other names" in label_text:
+                alt_names = [p.strip() for p in re.split(r"[;,/]", value) if p.strip()]
 
         genres = [
             a.get_text(strip=True)
@@ -188,6 +204,12 @@ class ManganatoSiteHandler(BaseSiteHandler):
             "genres": genres,
             "url": url,
         }
+        if status:
+            comic["status"] = status
+        if year is not None:
+            comic["year"] = year
+        if alt_names:
+            comic["alt_names"] = alt_names
         return SiteComicContext(comic=comic, title=title, identifier=slug, soup=soup)
 
     def get_chapters(self, context: SiteComicContext, scraper, language: str, make_request) -> List[Dict]:

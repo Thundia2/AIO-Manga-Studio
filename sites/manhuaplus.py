@@ -1,39 +1,21 @@
 from __future__ import annotations
-from typing import Dict, List
-from urllib.parse import urljoin
-from bs4 import BeautifulSoup
-from .base import BaseSiteHandler, SearchHit, SiteComicContext
-from .madara import madara_search_via_admin_ajax
 
-class ManhuaPlusSiteHandler(BaseSiteHandler):
-    name = "manhuaplus"
-    domains = ("manhuaplus.com", "www.manhuaplus.com")
-    _BASE_URL = "https://manhuaplus.com"
-    def configure_session(self, scraper, args) -> None:
-        scraper.headers.update({"Referer": f"{self._BASE_URL}/"})
-    def _make_soup(self, html: str) -> BeautifulSoup:
-        return BeautifulSoup(html, "html.parser")
-    def search(self, query: str, scraper, make_request, *, language: str = "en", limit: int = 20) -> List[SearchHit]:
-        # ManhuaPlus is a Madara WordPress site — reuse the shared admin-ajax
-        # search helper (sites/madara.py:madara_search_via_admin_ajax).
-        return madara_search_via_admin_ajax(
-            base_url=self._BASE_URL, site_name=self.name, query=query, scraper=scraper, limit=limit,
+from .madara import MadaraSiteHandler
+
+
+class ManhuaPlusSiteHandler(MadaraSiteHandler):
+    def __init__(self) -> None:
+        super().__init__("manhuaplus", "https://manhuaplus.com")
+        # manhuaplus.com renders chapter images inside `.read-container`,
+        # which the Madara base's default reader_selectors don't include.
+        # Without this override get_chapter_images would return 0 images
+        # and downloads would silently fail.
+        self.reader_selectors = (
+            "div.read-container img",
+            "div.reading-content img",
+            "div#chapter-images img",
+            "div.page-break img",
         )
-    def fetch_comic_context(self, url: str, scraper, make_request) -> SiteComicContext:
-        soup = self._make_soup(make_request(url, scraper).text)
-        title = soup.select_one("h1, .post-title")
-        title = title.get_text(strip=True) if title else "Unknown"
-        desc = soup.select_one(".summary__content p, .description-summary p")
-        description = desc.get_text(strip=True) if desc else ""
-        cover = soup.select_one(".summary_image img")
-        cover = cover.get("src") if cover else None
-        genres = [a.get_text(strip=True) for a in soup.select(".genres-content a")]
-        slug = url.rstrip("/").split("/")[-1]
-        return SiteComicContext(comic={"hid": slug, "title": title, "desc": description, "cover": cover, "genres": genres, "url": url}, title=title, identifier=slug, soup=soup)
-    def get_chapters(self, context: SiteComicContext, scraper, language: str, make_request) -> List[Dict]:
-        soup = context.soup or self._make_soup(make_request(context.comic.get("url"), scraper).text)
-        return [{"hid": link.get("href"), "chap": link.get_text(strip=True), "title": link.get_text(strip=True), "url": link.get("href"), "uploaded": None} for li in soup.select(".wp-manga-chapter") if (link := li.select_one("a"))]
-    def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
-        url = chapter.get("url")
-        soup = self._make_soup(make_request(url, scraper).text)
-        return [urljoin(url, img.get("src") or img.get("data-src")) for img in soup.select(".read-container img, .reading-content img") if img.get("src") or img.get("data-src")]
+
+
+__all__ = ["ManhuaPlusSiteHandler"]

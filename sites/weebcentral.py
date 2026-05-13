@@ -169,6 +169,10 @@ class WeebCentralSiteHandler(BaseSiteHandler):
         authors = self._extract_list_values(hero or soup, ["author"])
         tags = self._extract_list_values(hero or soup, ["tag", "type"])
         status_values = self._extract_list_values(hero or soup, ["status"])
+        alt_values = self._extract_list_values(
+            hero or soup, ["associated names", "alternative", "alias"]
+        )
+        year_values = self._extract_list_values(hero or soup, ["released", "year"])
 
         desc = self._extract_description(details)
         cover = self._source_image(hero, url)
@@ -187,6 +191,12 @@ class WeebCentralSiteHandler(BaseSiteHandler):
             comic["genres"] = tags
         if status_values:
             comic["status"] = status_values[0]
+        if alt_values:
+            comic["alt_names"] = alt_values
+        if year_values:
+            year_match = re.search(r"\b(\d{4})\b", year_values[0])
+            if year_match:
+                comic["year"] = int(year_match.group(1))
 
         return SiteComicContext(
             comic=comic,

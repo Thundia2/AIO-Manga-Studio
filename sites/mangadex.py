@@ -199,6 +199,26 @@ class MangaDexSiteHandler(BaseSiteHandler):
             "_manga_id": manga_id,
         }
 
+        status = attributes.get("status")
+        if isinstance(status, str) and status:
+            comic["status"] = status
+
+        # attributes.altTitles is a list of single-key {lang_code: title} dicts.
+        # Collect every string value; spec-pinned languages (en/ja/etc.) come
+        # first because the API returns them in catalog order.
+        alt_titles: List[str] = []
+        for entry in attributes.get("altTitles") or []:
+            if isinstance(entry, dict):
+                for value in entry.values():
+                    if isinstance(value, str) and value and value not in alt_titles:
+                        alt_titles.append(value)
+        if alt_titles:
+            comic["alt_names"] = alt_titles
+
+        year = attributes.get("year")
+        if isinstance(year, int) and year > 0:
+            comic["year"] = year
+
         return SiteComicContext(comic=comic, title=title, identifier=manga_id, soup=None)
 
     def get_chapters(

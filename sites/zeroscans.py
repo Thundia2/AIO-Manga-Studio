@@ -72,6 +72,32 @@ class ZeroScansSiteHandler(BaseSiteHandler):
             "_comic_id": comic_id,
         }
 
+        # The swordflake API isn't formally documented; field names below
+        # are tried in two reasonable shapes. Guarded so absent fields
+        # are no-op (no regression if the schema differs).
+        authors_raw = comic_data.get("authors") or comic_data.get("author")
+        if isinstance(authors_raw, list):
+            cleaned_authors = [
+                (a.get("name") if isinstance(a, dict) else a)
+                for a in authors_raw
+                if a
+            ]
+            cleaned_authors = [a for a in cleaned_authors if isinstance(a, str) and a]
+            if cleaned_authors:
+                comic["authors"] = cleaned_authors
+        elif isinstance(authors_raw, str) and authors_raw.strip():
+            comic["authors"] = [authors_raw.strip()]
+
+        year_raw = comic_data.get("year") or comic_data.get("release_year")
+        if isinstance(year_raw, int) and year_raw > 0:
+            comic["year"] = year_raw
+
+        alt_raw = comic_data.get("alt_titles") or comic_data.get("aliases")
+        if isinstance(alt_raw, list):
+            cleaned_alt = [a for a in alt_raw if isinstance(a, str) and a]
+            if cleaned_alt:
+                comic["alt_names"] = cleaned_alt
+
         return SiteComicContext(
             comic=comic,
             title=title,

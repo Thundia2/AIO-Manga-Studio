@@ -235,6 +235,26 @@ class AsuraSiteHandler(BaseSiteHandler):
         series_type_raw = self._extract_label_block(soup, "Type")
         series_type = series_type_raw.lower() if series_type_raw else None
 
+        # Year — Asura's "Released" label block. Pull first 4-digit token
+        # so we get the start year and not the end year.
+        released_raw = self._extract_label_block(soup, "Released")
+        year: Optional[int] = None
+        if released_raw:
+            year_match = re.search(r"\b(\d{4})\b", released_raw)
+            if year_match:
+                year = int(year_match.group(1))
+
+        # Alt names — Asura's series page sometimes carries an "Other Names"
+        # or "Alternative Names" label block. Both forms tried; missing
+        # blocks return None and yield no field.
+        alt_raw = (
+            self._extract_label_block(soup, "Other Names")
+            or self._extract_label_block(soup, "Alternative Names")
+        )
+        alt_names: List[str] = []
+        if alt_raw:
+            alt_names = [p.strip() for p in re.split(r"[,;/]", alt_raw) if p.strip()]
+
         comic: Dict[str, object] = {
             "hid": slug,
             "title": title,
@@ -255,6 +275,10 @@ class AsuraSiteHandler(BaseSiteHandler):
             comic["status"] = status
         if series_type:
             comic["type"] = series_type
+        if year is not None:
+            comic["year"] = year
+        if alt_names:
+            comic["alt_names"] = alt_names
 
         return SiteComicContext(
             comic=comic,

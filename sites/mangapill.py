@@ -62,8 +62,45 @@ class MangaPillSiteHandler(BaseSiteHandler):
         status_node = soup.select_one("div.container > div:first-child > div:last-child > div:nth-child(3) > div:nth-child(2) > div")
         status = status_node.get_text(strip=True) if status_node else "Unknown"
         
+        # Authors / year / alt names live in the metadata block
+        # (`div.container > div:first-child > div:last-child > div:nth-child(3)`)
+        # alongside status. The existing nth-child selector for status only
+        # picks one specific cell; walk the entire metadata block for the
+        # rest. Robust to label-row reordering, no-op when no label matches.
+        authors: List[str] = []
+        year: Optional[int] = None
+        alt_names: List[str] = []
+        meta_block = soup.select_one(
+            "div.container > div:first-child > div:last-child > div:nth-child(3)"
+        )
+        if meta_block:
+            for row in meta_block.find_all("div", recursive=False):
+                children = list(row.find_all("div", recursive=False))
+                if len(children) < 2:
+                    continue
+                label = children[0].get_text(strip=True).lower()
+                value_node = children[1]
+                value = value_node.get_text(" ", strip=True)
+                if not value:
+                    continue
+                if "author" in label:
+                    anchors = [
+                        a.get_text(strip=True)
+                        for a in value_node.find_all("a")
+                        if a.get_text(strip=True)
+                    ]
+                    authors = anchors or [value]
+                elif "year" in label or "released" in label:
+                    year_match = re.search(r"\b(\d{4})\b", value)
+                    if year_match:
+                        year = int(year_match.group(1))
+                elif "alternative" in label or label.startswith("alt"):
+                    alt_names = [
+                        p.strip() for p in re.split(r"[;,/]", value) if p.strip()
+                    ]
+
         slug = self._slug_from_url(url)
-        
+
         comic = {
             "hid": slug,
             "title": title,
@@ -73,6 +110,12 @@ class MangaPillSiteHandler(BaseSiteHandler):
             "genres": genres,
             "url": url,
         }
+        if authors:
+            comic["authors"] = authors
+        if year is not None:
+            comic["year"] = year
+        if alt_names:
+            comic["alt_names"] = alt_names
 
         return SiteComicContext(
             comic=comic,
